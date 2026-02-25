@@ -14,7 +14,7 @@
 在项目目录执行：
 
 ```bash
-python c:\Users\26494\Desktop\AFSIM_MCP\configure_mcp.py
+python configure_mcp.py
 ```
 
 脚本会按提示询问并写入本地配置，同时输出客户端所需的 MCP 配置片段。
@@ -82,7 +82,7 @@ python c:\Users\26494\Desktop\AFSIM_MCP\configure_mcp.py
 优先在终端直接运行：
 
 ```bash
-python C:\Users\26494\Desktop\AFSIM_MCP\transport\stdio.py
+python <AFSIM_MCP路径>\transport\stdio.py
 ```
 
 如果此命令报错，说明 Python 路径或依赖问题需要先解决。
