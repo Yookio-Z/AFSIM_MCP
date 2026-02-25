@@ -149,21 +149,21 @@ def main():
     print("\n解析结果：")
     for key, value in resolved.items():
         print(f"{key}: {value}")
-    state_dir_json = str(server.state_dir).replace("\\", "\\\\")
+    state_dir_str = str(server.state_dir)
     server_path = (Path(__file__).resolve().parent / "transport" / "stdio.py").resolve()
-    server_path_json = str(server_path).replace("\\", "\\\\")
-    python_path_json = sys.executable.replace("\\", "\\\\")
+    server_path_str = str(server_path)
+    python_path_str = sys.executable
     platform = prompt_platform()
     platform_name, payload = build_config_json(
         platform,
-        python_path_json,
-        [server_path_json],
-        {"AFSIM_MCP_STATE_DIR": state_dir_json},
+        python_path_str,
+        [server_path_str],
+        {"AFSIM_MCP_STATE_DIR": state_dir_str},
     )
     print("\n通用连接信息（填入你的 MCP 客户端配置即可）：")
-    print(f'command: "{python_path_json}"')
-    print(f'args: ["{server_path_json}"]')
-    print(f'env: {{"AFSIM_MCP_STATE_DIR": "{state_dir_json}"}}')
+    print(f'command: "{python_path_str}"')
+    print(f'args: ["{server_path_str}"]')
+    print(f'env: {{"AFSIM_MCP_STATE_DIR": "{state_dir_str}"}}')
     print(f"\n{platform_name} 配置示例：")
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     print("\n如果你的客户端配置文件键名不同，请保留 command/args/env 三项并按客户端要求嵌入。")
