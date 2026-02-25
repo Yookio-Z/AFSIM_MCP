@@ -1,0 +1,16 @@
+# Scenario: demo
+# 
+
+simulation_duration 7200s
+time_step 1.0s
+
+platform eagle
+  platform_type wsf_air_vehicle
+  position 35.5deg -80.2deg 10000m
+  wsf_air_mover eagle_mover
+  end_air_mover
+  wsf_radar_sensor eagle_sensor
+  end_radar_sensor
+  wsf_missile eagle_weapon
+  end_missile
+end_platform
