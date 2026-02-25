@@ -5,6 +5,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from subprocess import run
 
+# 标准 AFSIM 项目目录结构 —— 每次写出场景文件时强制创建
+STANDARD_PROJECT_DIRS = [
+    "doc",
+    "output",
+    "platforms",
+    "processors",
+    "scenarios",
+    "sensors",
+    "weapons",
+]
+
 try:
     from ..tools import build_tool_router, build_tool_specs
 except ImportError:
@@ -235,8 +246,40 @@ class MCPServer:
     def write_scenario_text(self, args):
         path = Path(args["path"])
         text = args.get("text") or ""
+
+        # ── 强制场景独立子目录规则 ────────────────────────────────────────────────
+        # 规则：场景文件必须位于 <project_root>/<scenario_name>/ 下面
+        #   · 入口文件  → <scenario_dir>/<name>.txt
+        #   · 定义文件  → <scenario_dir>/scenarios/<name>.txt（或其他子目录）
+        # 如果调用者把路径直接写成 <project_root>/<name>.txt，
+        # 则自动重定向到 <project_root>/<name>/<name>.txt
+        project_root = self.resolve_project_root()
+        if project_root:
+            pr = Path(project_root).resolve()
+            try:
+                rel = path.resolve().relative_to(pr)
+            except ValueError:
+                rel = None
+            # 路径直接在 project_root 下（只有一级，即 rel 只含一个部分）
+            if rel is not None and len(rel.parts) == 1:
+                scenario_name = path.stem
+                path = pr / scenario_name / path.name
+
+        # 确定场景根目录：若文件在 scenarios/ 等子目录内，根目录上一级
+        scenario_dir = path.parent
+        if scenario_dir.name in ("scenarios", "platforms", "sensors", "weapons",
+                                   "processors", "doc", "output"):
+            scenario_dir = scenario_dir.parent
+
+        # 强制初始化标准目录结构
+        structure = self.ensure_project_structure(scenario_dir)
         self.write_text(path, text)
-        return self.wrap({"path": str(path)})
+        return self.wrap({
+            "path": str(path),
+            "scenario_dir": str(scenario_dir),
+            "structure_enforced": True,
+            "directories": structure,
+        })
 
     def insert_scenario_block(self, args):
         path = Path(args["path"])
@@ -428,38 +471,41 @@ class MCPServer:
         return self.wrap(
             {
                 "directories": [
-                    {"name": "output", "description": "运行时输出日志、事件与 AER 文件"},
-                    {"name": "patterns", "description": "天线方向图等模式定义"},
-                    {"name": "platforms", "description": "平台与平台类型定义"},
+                    {"name": "doc",        "description": "文档、说明与参考资料"},
+                    {"name": "output",     "description": "运行时输出日志、事件与 AER 文件（勿手动编辑）"},
+                    {"name": "platforms",  "description": "平台与平台类型定义（platform_type）"},
                     {"name": "processors", "description": "处理器与脚本定义"},
-                    {"name": "scenarios", "description": "场景与平台配置"},
-                    {"name": "sensors", "description": "传感器定义"},
-                    {"name": "signatures", "description": "特征定义"},
-                    {"name": "weapons", "description": "武器定义"},
+                    {"name": "scenarios",  "description": "场景平台实例 + 航路定义（被入口文件 include）"},
+                    {"name": "sensors",    "description": "传感器定义"},
+                    {"name": "weapons",    "description": "武器定义"},
                 ],
+                "entry_file_convention": (
+                    "<scenario_name>.txt 放在场景根目录（file_path/event_pipe/end_time），"
+                    "平台实例文件放在 scenarios/<scenario_name>.txt，"
+                    "与官方 air_to_air demo 结构一致"
+                ),
                 "notes": [
-                    "目录层级没有强制要求",
-                    "输入文件可以包含其他输入文件",
-                    "可合并为单一文件但不推荐",
+                    "每个场景拥有独立的具名子目录 <project_root>/<scenario_name>/",
+                    "write_scenario_text / create_scenario_from_prompt 会自动强制此结构",
+                    "入口文件用 file_path . 使所有相对路径从该目录解析",
                 ],
             }
         )
 
     def generate_project_structure_overview(self, args):
-        project_name = args.get("project_name") or "projectName"
-        lines = [f"{project_name}/"]
-        entries = [
-            ("output", "运行时输出日志、事件与 AER 文件"),
-            ("patterns", "天线方向图等模式定义"),
-            ("platforms", "平台与平台类型定义"),
-            ("processors", "处理器与脚本定义"),
-            ("scenarios", "场景与平台配置"),
-            ("sensors", "传感器定义"),
-            ("signatures", "特征定义"),
-            ("weapons", "武器定义"),
+        project_name = args.get("project_name") or "scenarioName"
+        lines = [
+            f"<project_root>/{project_name}/          ← 场景独立根目录",
+            f"  {project_name}.txt                    ← 入口文件（file_path/event_pipe/end_time）",
+            f"  doc/                                  ← 文档",
+            f"  output/                               ← 仿真输出 (.aer/.evt/.log)",
+            f"  platforms/                            ← platform_type 定义",
+            f"  processors/                           ← 处理器脚本",
+            f"  scenarios/",
+            f"    {project_name}.txt                  ← 平台实例 + 航路（被入口 include）",
+            f"  sensors/                              ← 传感器定义",
+            f"  weapons/                              ← 武器定义",
         ]
-        for name, desc in entries:
-            lines.append(f"  {name}/  - {desc}")
         text = "\n".join(lines) + "\n"
         return self.wrap({"text": text})
 
@@ -478,16 +524,8 @@ class MCPServer:
         target.mkdir(parents=True, exist_ok=True)
         directories = args.get("directories")
         if directories is None:
-            directories = [
-                "output",
-                "patterns",
-                "platforms",
-                "processors",
-                "scenarios",
-                "sensors",
-                "signatures",
-                "weapons",
-            ]
+            # 使用强制标准目录（与 ensure_project_structure 保持一致）
+            directories = list(STANDARD_PROJECT_DIRS)
         created = []
         for name in directories:
             if not name:
@@ -843,6 +881,34 @@ class MCPServer:
             output = Path(project_dir) / output
         if output.suffix == "":
             output = output.with_suffix(".txt")
+
+        # ── 强制场景独立子目录 ─────────────────────────────────────────────────
+        # 场景组织结构（镜像官方 demo）：
+        #   <project_root>/<scenario_name>/
+        #     <scenario_name>.txt          ← 入口文件（含 file_path/event_pipe/end_time）
+        #     scenarios/<scenario_name>.txt ← 平台实例 + 航路
+        #     platforms/ sensors/ weapons/ processors/ doc/ output/
+        #
+        # 如果 output_path 给出的是 project_root 直接子文件，自动重定向到子目录
+        project_root_p = Path(project_dir) if project_dir else None
+        if not project_root_p:
+            project_root_p = self.resolve_project_root()
+        if project_root_p:
+            pr = Path(project_root_p).resolve()
+            try:
+                rel = output.resolve().relative_to(pr)
+            except ValueError:
+                rel = None
+            if rel is not None and len(rel.parts) == 1:
+                scenario_name_stem = output.stem
+                output = pr / scenario_name_stem / "scenarios" / output.name
+
+        scenario_dir = output.parent
+        if scenario_dir.name in ("scenarios", "platforms", "sensors", "weapons",
+                                   "processors", "doc", "output"):
+            scenario_dir = scenario_dir.parent
+        self.ensure_project_structure(scenario_dir)
+
         counts = self.parse_prompt_counts(prompt)
         aircraft_count = int(args.get("aircraft_count") or counts.get("aircraft") or 3)
         tank_count = int(args.get("tank_count") or counts.get("tank") or 3)
@@ -980,6 +1046,21 @@ class MCPServer:
         path.parent.mkdir(parents=True, exist_ok=True)
         Path(path).write_text(text, encoding="utf-8")
 
+    def ensure_project_structure(self, project_dir: Path) -> list:
+        """强制创建标准 AFSIM 项目目录结构。
+
+        无论用户是否指定，每次向项目目录写出场景文件时均会自动调用。
+        标准子目录：doc / output / platforms / processors / scenarios / sensors / weapons
+        """
+        project_dir = Path(project_dir)
+        project_dir.mkdir(parents=True, exist_ok=True)
+        created = []
+        for name in STANDARD_PROJECT_DIRS:
+            sub = project_dir / name
+            sub.mkdir(exist_ok=True)
+            created.append(str(sub))
+        return created
+
     def read_text(self, path):
         return Path(path).read_text(encoding="utf-8", errors="ignore")
 
@@ -1058,6 +1139,38 @@ class MCPServer:
 
     def get_demos_root(self):
         return self.resolve_demos_root()
+
+    def get_observer_block(self):
+        """Return the standard Brawler observer script_variables block.
+
+        log_print and iout_print default to false so LOG.N / IOUT.N files
+        are NOT generated. Paste into the entry-point scenario file.
+        """
+        text = (
+            "$define REP 1\n"
+            "\n"
+            "script_variables\n"
+            "   double closest_hostile = 1000*MATH.M_PER_NM();\n"
+            "   bool log_print    = false;  // set true to generate LOG output\n"
+            "   bool iout_print   = false;  // set true to generate IOUT output\n"
+            "   bool sensor_print = false;\n"
+            "   WsfGeoPoint origin = WsfGeoPoint.Construct(\"00:00:00.00n 00:00:00.00e\");\n"
+            "   int rseed = (int)WsfSimulation.RandomSeed();\n"
+            "   Array<string> log_string    = {\"output/\",\"LOG\",\".\",(string)$<REP>$};\n"
+            "   Array<string> iout_string   = {\"output/\",\"IOUT\",\".\",(string)$<REP>$};\n"
+            "   Array<string> sensor_string = {\"output/\",\"SENSOR\",\".\",(string)$<REP>$};\n"
+            "   string log_path    = \"\".Join(log_string);\n"
+            "   string iout_path   = \"\".Join(iout_string);\n"
+            "   string sensor_path = \"\".Join(sensor_string);\n"
+            "   FileIO log      = FileIO();\n"
+            "   FileIO iout     = FileIO();\n"
+            "   FileIO sensorIO = FileIO();\n"
+            "end_script_variables\n"
+            "\n"
+            "include_once observer.txt\n"
+            "include_once sensor_observer.txt\n"
+        )
+        return self.wrap({"text": text})
 
     def generate_basic_scenario_text(
         self, aircraft_count, tank_count, side, duration_min, center_lat, center_lon

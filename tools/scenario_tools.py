@@ -73,7 +73,15 @@ def specs():
         },
         {
             "name": "write_scenario_text",
-            "description": "Write a scenario text file.",
+            "description": (
+                "Write a scenario text file. "
+                "ENFORCES standard per-scenario directory layout mirroring official AFSIM demos: "
+                "each scenario lives in its own named subfolder <project_root>/<scenario_name>/, "
+                "with subdirs doc/output/platforms/processors/scenarios/sensors/weapons/. "
+                "Entry-point file goes at <scenario_name>/<scenario_name>.txt (contains file_path/event_pipe/end_time); "
+                "platform instances go at <scenario_name>/scenarios/<scenario_name>.txt. "
+                "If path is given directly under project_root, it is automatically redirected into the named subdirectory."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -261,6 +269,16 @@ def specs():
             "description": "Get MCP config paths and resolved locations.",
             "inputSchema": {"type": "object", "properties": {}},
         },
+        {
+            "name": "get_observer_block",
+            "description": (
+                "Return the standard Brawler observer script_variables block for use in AFSIM entry-point scenario files. "
+                "Always call this tool to get the block instead of writing it manually. "
+                "log_print and iout_print are set to false by default so LOG.N and IOUT.N files are NOT generated. "
+                "Paste the returned text into the entry-point .txt file after the include_once lines and before event_pipe."
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+        },
     ]
 
 
@@ -289,4 +307,5 @@ def router(server):
         "init_project_structure": server.init_project_structure,
         "set_paths_config": server.set_paths_config,
         "get_paths_config": server.get_paths_config,
+        "get_observer_block": lambda _: server.get_observer_block(),
     }
