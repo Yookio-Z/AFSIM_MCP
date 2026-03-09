@@ -91,3 +91,30 @@ python <AFSIM_MCP路径>\transport\stdio.py
 
 不需要。客户端会自动拉起本地 MCP 进程。  
 若客户端找不到 python，可使用脚本生成的绝对路径配置。
+
+### 路径访问被拒绝（Path not allowed）
+
+为避免工具被误用导致任意文件读写，服务器默认只允许访问这些根目录：
+
+- `AFSIM_MCP_STATE_DIR`（状态目录）
+- `project_root`（配置的工程目录）
+- `demos_root`（配置的 demos 目录）
+- 以及（只读）`afsim_root`
+
+如确需放宽：
+
+- 允许额外目录：设置 `AFSIM_MCP_EXTRA_PATHS`（用 `;` 分隔多个路径）
+- 完全禁用限制（不推荐）：设置 `AFSIM_MCP_ALLOW_ANY_PATH=1`
+
+### 任务卡住/输出过大
+
+`run_mission` / `run_wizard` 等支持：
+
+- `timeout_sec`：超时（避免一直阻塞）
+- `max_output_chars`：截断 stdout/stderr（避免输出过大）
+- `background=true`：后台启动（立即返回 `process_id`）
+
+后台进程可用工具查询/停止：
+
+- `get_process_status`（输入 `process_id`）
+- `stop_process`（输入 `process_id`）
