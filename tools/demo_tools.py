@@ -25,7 +25,7 @@ def specs():
         },
         {
             "name": "create_scenario_from_prompt",
-            "description": "Generate a basic AFSIM scenario text file from a natural language prompt. Automatically enforces the standard AFSIM project directory structure (doc/output/platforms/processors/scenarios/sensors/weapons) under project_dir or the output file's parent directory.",
+            "description": "Generate a basic AFSIM scenario from a natural language prompt. Creates a demo-style per-scenario directory with two files: <scenario>/<scenario>.txt (entry point with file_path/event_pipe/end_time) and <scenario>/scenarios/<scenario>.txt (platform instances/routes). Automatically enforces the standard AFSIM project directory structure (doc/output/platforms/processors/scenarios/sensors/weapons).",
             "inputSchema": {
                 "type": "object",
                 "properties": {

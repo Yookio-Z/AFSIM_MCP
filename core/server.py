@@ -3,7 +3,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from subprocess import run
+from subprocess import DEVNULL, Popen, TimeoutExpired, run
 
 # 标准 AFSIM 项目目录结构 —— 每次写出场景文件时强制创建
 STANDARD_PROJECT_DIRS = [
@@ -22,6 +22,20 @@ except ImportError:
     from tools import build_tool_router, build_tool_specs
 
 
+class JsonRpcError(Exception):
+    def __init__(self, code: int, message: str, data=None):
+        super().__init__(message)
+        self.code = int(code)
+        self.message = str(message)
+        self.data = data
+
+    def to_error_obj(self):
+        obj = {"code": self.code, "message": self.message}
+        if self.data is not None:
+            obj["data"] = self.data
+        return obj
+
+
 class MCPServer:
     def __init__(self):
         self.base_dir = self.resolve_base_dir()
@@ -29,10 +43,16 @@ class MCPServer:
         self.scenarios_dir = self.state_dir / "scenarios"
         self.runs_dir = self.state_dir / "runs"
         self.results_dir = self.state_dir / "results"
+        self.processes_dir = self.state_dir / "processes"
         self.config_path = self.state_dir / "config.json"
         self.scenarios_dir.mkdir(parents=True, exist_ok=True)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.results_dir.mkdir(parents=True, exist_ok=True)
+        self.processes_dir.mkdir(parents=True, exist_ok=True)
+
+        self._tool_specs = build_tool_specs()
+        self._tool_router = build_tool_router(self)
+        self._processes = {}
 
     def resolve_base_dir(self):
         env_dir = os.environ.get("AFSIM_MCP_BASE_DIR")
@@ -93,10 +113,14 @@ class MCPServer:
         return None
 
     def tools_list(self):
-        return build_tool_specs()
+        return self._tool_specs
 
     def handle_request(self, request):
+        if not isinstance(request, dict):
+            raise JsonRpcError(-32600, "Invalid Request", {"reason": "request must be an object"})
         method = request.get("method")
+        if not method:
+            raise JsonRpcError(-32600, "Invalid Request", {"reason": "missing method"})
         if method == "initialize":
             return {
                 "protocolVersion": "2024-11-05",
@@ -106,18 +130,32 @@ class MCPServer:
         if method == "tools/list":
             return {"tools": self.tools_list()}
         if method == "tools/call":
-            params = request.get("params") or {}
+            params = request.get("params")
+            if params is None:
+                params = {}
+            if not isinstance(params, dict):
+                raise JsonRpcError(-32602, "Invalid params", {"reason": "params must be an object"})
             name = params.get("name")
-            arguments = params.get("arguments") or {}
+            if not name or not isinstance(name, str):
+                raise JsonRpcError(-32602, "Invalid params", {"reason": "params.name must be a string"})
+            arguments = params.get("arguments")
+            if arguments is None:
+                arguments = {}
+            if not isinstance(arguments, dict):
+                raise JsonRpcError(-32602, "Invalid params", {"reason": "params.arguments must be an object"})
             return self.call_tool(name, arguments)
-        return {"error": f"Unsupported method: {method}"}
+        raise JsonRpcError(-32601, f"Unsupported method: {method}")
 
     def call_tool(self, name, arguments):
-        router = build_tool_router(self)
-        handler = router.get(name)
+        handler = self._tool_router.get(name)
         if handler:
-            return handler(arguments)
-        return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}]}
+            try:
+                return handler(arguments)
+            except JsonRpcError:
+                raise
+            except Exception as exc:
+                raise JsonRpcError(-32000, "Tool execution failed", {"tool": name, "error": str(exc)})
+        raise JsonRpcError(-32601, f"Unknown tool: {name}")
 
     def create_scenario(self, args):
         scenario_id = str(uuid.uuid4())
@@ -239,12 +277,13 @@ class MCPServer:
         return self.wrap({"valid": valid, "issues": issues})
 
     def read_scenario_text(self, args):
-        path = Path(args["path"])
+        path = Path(self.require_str(args, "path"))
+        self.assert_path_allowed(path, write=False, purpose="read_scenario_text")
         text = self.read_text(path)
         return self.wrap({"path": str(path), "text": text})
 
     def write_scenario_text(self, args):
-        path = Path(args["path"])
+        path = Path(self.require_str(args, "path"))
         text = args.get("text") or ""
 
         # ── 强制场景独立子目录规则 ────────────────────────────────────────────────
@@ -265,11 +304,15 @@ class MCPServer:
                 scenario_name = path.stem
                 path = pr / scenario_name / path.name
 
+        self.assert_path_allowed(path, write=True, purpose="write_scenario_text")
+
         # 确定场景根目录：若文件在 scenarios/ 等子目录内，根目录上一级
         scenario_dir = path.parent
         if scenario_dir.name in ("scenarios", "platforms", "sensors", "weapons",
                                    "processors", "doc", "output"):
             scenario_dir = scenario_dir.parent
+
+        self.assert_path_allowed(scenario_dir, write=True, purpose="write_scenario_text(scenario_dir)")
 
         # 强制初始化标准目录结构
         structure = self.ensure_project_structure(scenario_dir)
@@ -282,15 +325,16 @@ class MCPServer:
         })
 
     def insert_scenario_block(self, args):
-        path = Path(args["path"])
-        anchor = args["anchor"]
-        block = args["block"]
+        path = Path(self.require_str(args, "path"))
+        anchor = self.require_str(args, "anchor", allow_empty=True)
+        block = self.require_str(args, "block", allow_empty=True)
         position = args.get("position") or "after"
         occurrence = args.get("occurrence") or "first"
+        self.assert_path_allowed(path, write=True, purpose="insert_scenario_block")
         text = self.read_text(path)
         idx = text.find(anchor) if occurrence == "first" else text.rfind(anchor)
         if idx == -1:
-            return self.wrap({"error": "anchor not found"})
+            raise JsonRpcError(-32602, "anchor not found", {"path": str(path), "anchor": anchor})
         if position == "before":
             new_text = text[:idx] + block + text[idx:]
         elif position == "replace":
@@ -301,7 +345,8 @@ class MCPServer:
         return self.wrap({"path": str(path), "modified": True})
 
     def extract_includes(self, args):
-        path = Path(args["path"])
+        path = Path(self.require_str(args, "path"))
+        self.assert_path_allowed(path, write=False, purpose="extract_includes")
         lines = self.read_text(path).splitlines()
         includes = []
         for line in lines:
@@ -315,14 +360,30 @@ class MCPServer:
         return self.wrap({"path": str(path), "includes": includes})
 
     def search_definitions(self, args):
-        kind = args["kind"]
+        kind = self.require_str(args, "kind")
         query = (args.get("query") or "").strip()
         max_results = int(args.get("max_results") or 200)
         roots = args.get("roots")
         default_root = self.resolve_afsim_root()
         if not default_root:
             default_root = self.base_dir.parent
-        search_roots = [Path(p) for p in roots] if roots else [default_root]
+        if roots is not None:
+            if not isinstance(roots, list) or not all(isinstance(p, str) for p in roots):
+                raise JsonRpcError(-32602, "Invalid params", {"reason": "roots must be an array of strings"})
+            search_roots = [Path(p) for p in roots]
+        else:
+            search_roots = [default_root]
+
+        filtered_roots = []
+        for root in search_roots:
+            try:
+                self.assert_path_allowed(root, write=False, purpose="search_definitions")
+            except JsonRpcError:
+                continue
+            filtered_roots.append(root)
+        if roots is not None and not filtered_roots:
+            raise JsonRpcError(-32602, "No allowed roots", {"roots": roots})
+        search_roots = filtered_roots
         kind_map = {
             "signature": [
                 "radar_signature",
@@ -674,7 +735,7 @@ class MCPServer:
     def run_wizard(self, args):
         wizard_path = self.resolve_wizard_path()
         if not wizard_path:
-            return self.wrap({"error": "wizard path not configured"})
+            raise JsonRpcError(-32002, "wizard executable not found", {"tool": "run_wizard"})
         cmd = [str(wizard_path)]
         if args.get("console", True):
             cmd.append("-console")
@@ -684,95 +745,183 @@ class MCPServer:
         else:
             cmd.append(str(raw_args))
         working_dir = args.get("working_dir")
-        result = run(
+        if working_dir:
+            self.assert_path_allowed(Path(working_dir), write=True, purpose="run_wizard(working_dir)")
+        timeout_sec = args.get("timeout_sec")
+        background = bool(args.get("background", False))
+        max_output_chars = args.get("max_output_chars")
+        return self.run_process(
             cmd,
-            capture_output=True,
-            text=True,
-            cwd=working_dir if working_dir else None,
-        )
-        return self.wrap(
-            {
-                "returncode": result.returncode,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-            }
+            working_dir,
+            timeout_sec=float(timeout_sec) if timeout_sec else None,
+            background=background,
+            max_output_chars=int(max_output_chars) if max_output_chars else 20000,
         )
 
     def run_mission(self, args):
         exe = self.resolve_exe("mission")
         if not exe:
-            return self.wrap({"error": "mission executable not found"})
-        scenario = args.get("scenario")
-        cmd = [str(exe), str(scenario)]
-        return self.run_process(cmd, args.get("working_dir"))
+            raise JsonRpcError(-32002, "mission executable not found", {"tool": "run_mission"})
+        scenario = self.require_str(args, "scenario")
+        scenario_path = Path(scenario)
+        self.assert_path_allowed(scenario_path, write=False, purpose="run_mission(scenario)")
+        working_dir = args.get("working_dir")
+        if working_dir:
+            self.assert_path_allowed(Path(working_dir), write=True, purpose="run_mission(working_dir)")
+        else:
+            working_dir = str(scenario_path.parent)
+            self.assert_path_allowed(Path(working_dir), write=True, purpose="run_mission(default_working_dir)")
+        timeout_sec = args.get("timeout_sec")
+        background = bool(args.get("background", False))
+        max_output_chars = args.get("max_output_chars")
+        cmd = [str(exe), str(scenario_path)]
+        return self.run_process(
+            cmd,
+            working_dir,
+            timeout_sec=float(timeout_sec) if timeout_sec else None,
+            background=background,
+            max_output_chars=int(max_output_chars) if max_output_chars else 20000,
+        )
 
     def run_mission_with_args(self, args):
         exe = self.resolve_exe("mission")
         if not exe:
-            return self.wrap({"error": "mission executable not found"})
-        scenario = args.get("scenario")
+            raise JsonRpcError(-32002, "mission executable not found", {"tool": "run_mission_with_args"})
+        scenario = self.require_str(args, "scenario")
+        scenario_path = Path(scenario)
+        self.assert_path_allowed(scenario_path, write=False, purpose="run_mission_with_args(scenario)")
         raw_args = args.get("args") or []
-        cmd = [str(exe), str(scenario)]
+        cmd = [str(exe), str(scenario_path)]
         if isinstance(raw_args, list):
             cmd.extend([str(a) for a in raw_args])
         else:
             cmd.append(str(raw_args))
-        return self.run_process(cmd, args.get("working_dir"))
+        working_dir = args.get("working_dir")
+        if working_dir:
+            self.assert_path_allowed(Path(working_dir), write=True, purpose="run_mission_with_args(working_dir)")
+        else:
+            working_dir = str(scenario_path.parent)
+            self.assert_path_allowed(Path(working_dir), write=True, purpose="run_mission_with_args(default_working_dir)")
+        timeout_sec = args.get("timeout_sec")
+        background = bool(args.get("background", False))
+        max_output_chars = args.get("max_output_chars")
+        return self.run_process(
+            cmd,
+            working_dir,
+            timeout_sec=float(timeout_sec) if timeout_sec else None,
+            background=background,
+            max_output_chars=int(max_output_chars) if max_output_chars else 20000,
+        )
 
     def run_warlock(self, args):
         exe = self.resolve_exe("warlock")
         if not exe:
-            return self.wrap({"error": "warlock executable not found"})
+            raise JsonRpcError(-32002, "warlock executable not found", {"tool": "run_warlock"})
         cmd = [str(exe)]
         raw_args = args.get("args") or []
         if isinstance(raw_args, list):
             cmd.extend([str(a) for a in raw_args])
         else:
             cmd.append(str(raw_args))
-        return self.run_process(cmd, args.get("working_dir"))
+        working_dir = args.get("working_dir")
+        if working_dir:
+            self.assert_path_allowed(Path(working_dir), write=True, purpose="run_warlock(working_dir)")
+        timeout_sec = args.get("timeout_sec")
+        background = bool(args.get("background", False))
+        max_output_chars = args.get("max_output_chars")
+        return self.run_process(
+            cmd,
+            working_dir,
+            timeout_sec=float(timeout_sec) if timeout_sec else None,
+            background=background,
+            max_output_chars=int(max_output_chars) if max_output_chars else 20000,
+        )
 
     def run_mystic(self, args):
         exe = self.resolve_exe("mystic")
         if not exe:
-            return self.wrap({"error": "mystic executable not found"})
+            raise JsonRpcError(-32002, "mystic executable not found", {"tool": "run_mystic"})
         cmd = [str(exe)]
         recording = args.get("recording")
         if recording:
-            cmd.append(str(recording))
-        return self.run_process(cmd, args.get("working_dir"))
+            rec_path = Path(str(recording))
+            self.assert_path_allowed(rec_path, write=False, purpose="run_mystic(recording)")
+            cmd.append(str(rec_path))
+        working_dir = args.get("working_dir")
+        if working_dir:
+            self.assert_path_allowed(Path(working_dir), write=True, purpose="run_mystic(working_dir)")
+        timeout_sec = args.get("timeout_sec")
+        background = bool(args.get("background", False))
+        max_output_chars = args.get("max_output_chars")
+        return self.run_process(
+            cmd,
+            working_dir,
+            timeout_sec=float(timeout_sec) if timeout_sec else None,
+            background=background,
+            max_output_chars=int(max_output_chars) if max_output_chars else 20000,
+        )
 
     def run_engage(self, args):
         exe = self.resolve_exe("engage")
         if not exe:
-            return self.wrap({"error": "engage executable not found"})
+            raise JsonRpcError(-32002, "engage executable not found", {"tool": "run_engage"})
         cmd = [str(exe)]
         raw_args = args.get("args") or []
         if isinstance(raw_args, list):
             cmd.extend([str(a) for a in raw_args])
         else:
             cmd.append(str(raw_args))
-        return self.run_process(cmd, args.get("working_dir"))
+        working_dir = args.get("working_dir")
+        if working_dir:
+            self.assert_path_allowed(Path(working_dir), write=True, purpose="run_engage(working_dir)")
+        timeout_sec = args.get("timeout_sec")
+        background = bool(args.get("background", False))
+        max_output_chars = args.get("max_output_chars")
+        return self.run_process(
+            cmd,
+            working_dir,
+            timeout_sec=float(timeout_sec) if timeout_sec else None,
+            background=background,
+            max_output_chars=int(max_output_chars) if max_output_chars else 20000,
+        )
 
     def run_sensor_plot(self, args):
         exe = self.resolve_exe("sensor_plot")
         if not exe:
-            return self.wrap({"error": "sensor_plot executable not found"})
+            raise JsonRpcError(-32002, "sensor_plot executable not found", {"tool": "run_sensor_plot"})
         cmd = [str(exe)]
         raw_args = args.get("args") or []
         if isinstance(raw_args, list):
             cmd.extend([str(a) for a in raw_args])
         else:
             cmd.append(str(raw_args))
-        return self.run_process(cmd, args.get("working_dir"))
+        working_dir = args.get("working_dir")
+        if working_dir:
+            self.assert_path_allowed(Path(working_dir), write=True, purpose="run_sensor_plot(working_dir)")
+        timeout_sec = args.get("timeout_sec")
+        background = bool(args.get("background", False))
+        max_output_chars = args.get("max_output_chars")
+        return self.run_process(
+            cmd,
+            working_dir,
+            timeout_sec=float(timeout_sec) if timeout_sec else None,
+            background=background,
+            max_output_chars=int(max_output_chars) if max_output_chars else 20000,
+        )
 
     def batch_run_mission(self, args):
         exe = self.resolve_exe("mission")
         if not exe:
-            return self.wrap({"error": "mission executable not found"})
+            raise JsonRpcError(-32002, "mission executable not found", {"tool": "batch_run_mission"})
         scenarios = args.get("scenarios") or []
+        if not isinstance(scenarios, list) or not all(isinstance(s, str) for s in scenarios):
+            raise JsonRpcError(-32602, "Invalid params", {"reason": "scenarios must be an array of strings"})
         working_dir = args.get("working_dir")
+        if working_dir:
+            self.assert_path_allowed(Path(working_dir), write=True, purpose="batch_run_mission(working_dir)")
         results = []
         for scenario in scenarios:
+            self.assert_path_allowed(Path(scenario), write=False, purpose="batch_run_mission(scenario)")
             result = run(
                 [str(exe), str(scenario)],
                 capture_output=True,
@@ -790,14 +939,25 @@ class MCPServer:
         return self.wrap({"results": results})
 
     def run_mission_and_open_mystic(self, args):
-        scenario = args.get("scenario")
+        scenario = self.require_str(args, "scenario")
+        scenario_path = Path(scenario)
+        self.assert_path_allowed(scenario_path, write=False, purpose="run_mission_and_open_mystic(scenario)")
         working_dir = args.get("working_dir")
         open_mystic = args.get("open_mystic")
         if open_mystic is None:
             open_mystic = True
-        scenario_path = Path(scenario)
         working_root = Path(working_dir) if working_dir else scenario_path.parent
-        mission_result = self.run_mission({"scenario": scenario, "working_dir": str(working_root)})
+        self.assert_path_allowed(working_root, write=True, purpose="run_mission_and_open_mystic(working_dir)")
+        timeout_sec = args.get("timeout_sec")
+        max_output_chars = args.get("max_output_chars")
+        mission_result = self.run_mission(
+            {
+                "scenario": str(scenario_path),
+                "working_dir": str(working_root),
+                "timeout_sec": timeout_sec,
+                "max_output_chars": max_output_chars,
+            }
+        )
         latest_aer = self.find_latest_aer(working_root)
         mystic_result = None
         if open_mystic and latest_aer:
@@ -815,7 +975,8 @@ class MCPServer:
         )
 
     def open_latest_aer_in_mystic(self, args):
-        directory = Path(args.get("directory"))
+        directory = Path(self.require_str(args, "directory"))
+        self.assert_path_allowed(directory, write=False, purpose="open_latest_aer_in_mystic(directory)")
         latest_aer = self.find_latest_aer(directory)
         if not latest_aer:
             return self.wrap({"error": "no aer files found"})
@@ -846,6 +1007,7 @@ class MCPServer:
         base = demos / demo
         if not base.exists():
             return self.wrap({"error": "demo not found"})
+        self.assert_path_allowed(base, write=False, purpose="list_demo_scenarios")
         scenarios = sorted([str(p) for p in base.rglob("*.txt")])
         return self.wrap({"scenarios": scenarios})
 
@@ -872,9 +1034,7 @@ class MCPServer:
 
     def create_scenario_from_prompt(self, args):
         prompt = args.get("prompt") or ""
-        output_path = args.get("output_path")
-        if not output_path:
-            return self.wrap({"error": "output_path is required"})
+        output_path = self.require_str(args, "output_path")
         output = Path(output_path)
         project_dir = args.get("project_dir")
         if project_dir and not output.is_absolute():
@@ -882,32 +1042,42 @@ class MCPServer:
         if output.suffix == "":
             output = output.with_suffix(".txt")
 
+        scenario_name = output.stem
+
         # ── 强制场景独立子目录 ─────────────────────────────────────────────────
-        # 场景组织结构（镜像官方 demo）：
+        # 输出结构（镜像官方 demo）：
         #   <project_root>/<scenario_name>/
-        #     <scenario_name>.txt          ← 入口文件（含 file_path/event_pipe/end_time）
-        #     scenarios/<scenario_name>.txt ← 平台实例 + 航路
-        #     platforms/ sensors/ weapons/ processors/ doc/ output/
-        #
-        # 如果 output_path 给出的是 project_root 直接子文件，自动重定向到子目录
+        #     <scenario_name>.txt           ← 入口文件（file_path/event_pipe/end_time）
+        #     scenarios/<scenario_name>.txt ← 平台实例 + 航路（被入口 include_once）
         project_root_p = Path(project_dir) if project_dir else None
         if not project_root_p:
             project_root_p = self.resolve_project_root()
+
+        entry_path = output
+        scenario_root = output.parent
+
+        if output.parent.name == "scenarios":
+            scenario_root = output.parent.parent
+            entry_path = scenario_root / f"{scenario_name}.txt"
+        elif output.parent.name in ("platforms", "sensors", "weapons", "processors", "doc", "output"):
+            scenario_root = output.parent.parent
+            entry_path = scenario_root / f"{scenario_name}.txt"
+
         if project_root_p:
             pr = Path(project_root_p).resolve()
             try:
-                rel = output.resolve().relative_to(pr)
+                rel = entry_path.resolve().relative_to(pr)
             except ValueError:
                 rel = None
             if rel is not None and len(rel.parts) == 1:
-                scenario_name_stem = output.stem
-                output = pr / scenario_name_stem / "scenarios" / output.name
+                scenario_root = pr / scenario_name
+                entry_path = scenario_root / f"{scenario_name}.txt"
 
-        scenario_dir = output.parent
-        if scenario_dir.name in ("scenarios", "platforms", "sensors", "weapons",
-                                   "processors", "doc", "output"):
-            scenario_dir = scenario_dir.parent
-        self.ensure_project_structure(scenario_dir)
+        scenario_file_path = scenario_root / "scenarios" / f"{scenario_name}.txt"
+
+        self.assert_path_allowed(entry_path, write=True, purpose="create_scenario_from_prompt(entry)")
+        self.assert_path_allowed(scenario_file_path, write=True, purpose="create_scenario_from_prompt(scenarios)")
+        self.ensure_project_structure(scenario_root)
 
         counts = self.parse_prompt_counts(prompt)
         aircraft_count = int(args.get("aircraft_count") or counts.get("aircraft") or 3)
@@ -917,18 +1087,23 @@ class MCPServer:
         center = args.get("center") or {}
         lat = float(center.get("lat") or 21.325)
         lon = float(center.get("lon") or -158.51)
-        text = self.generate_basic_scenario_text(
+
+        scenarios_text = self.generate_basic_scenario_entities_text(
             aircraft_count=aircraft_count,
             tank_count=tank_count,
             side=side,
-            duration_min=duration_min,
             center_lat=lat,
             center_lon=lon,
         )
-        self.write_text(output, text)
+        entry_text = self.generate_basic_entrypoint_text(scenario_name=scenario_name, duration_min=duration_min)
+        self.write_text(scenario_file_path, scenarios_text)
+        self.write_text(entry_path, entry_text)
         return self.wrap(
             {
-                "path": str(output),
+                "path": str(entry_path),
+                "entry_path": str(entry_path),
+                "scenario_path": str(scenario_file_path),
+                "scenario_dir": str(scenario_root),
                 "aircraft_count": aircraft_count,
                 "tank_count": tank_count,
                 "side": side,
@@ -947,12 +1122,14 @@ class MCPServer:
         demo_dir = demos / demo
         if not demo_dir.exists():
             return self.wrap({"error": "demo not found"})
+        self.assert_path_allowed(demo_dir, write=True, purpose="run_demo(demo_dir)")
         scenario_path = Path(scenario)
         if not scenario_path.is_absolute():
             scenario_path = demo_dir / scenario
+        self.assert_path_allowed(scenario_path, write=False, purpose="run_demo(scenario)")
         mission_exe = self.resolve_exe("mission")
         if not mission_exe:
-            return self.wrap({"error": "mission executable not found"})
+            raise JsonRpcError(-32002, "mission executable not found", {"tool": "run_demo"})
         mission_result = self.run_process(
             [str(mission_exe), str(scenario_path)],
             str(demo_dir),
@@ -974,7 +1151,8 @@ class MCPServer:
         )
 
     def list_output_files(self, args):
-        directory = Path(args.get("directory"))
+        directory = Path(self.require_str(args, "directory"))
+        self.assert_path_allowed(directory, write=False, purpose="list_output_files")
         if not directory.exists():
             return self.wrap({"error": "directory not found"})
         extensions = args.get("extensions") or ["aer", "evt", "log"]
@@ -995,12 +1173,14 @@ class MCPServer:
         return self.wrap({"files": files})
 
     def find_latest_aer_tool(self, args):
-        directory = Path(args.get("directory"))
+        directory = Path(self.require_str(args, "directory"))
+        self.assert_path_allowed(directory, write=False, purpose="find_latest_aer")
         latest_aer = self.find_latest_aer(directory)
         return self.wrap({"path": str(latest_aer) if latest_aer else None})
 
     def summarize_evt(self, args):
-        path = Path(args.get("path"))
+        path = Path(self.require_str(args, "path"))
+        self.assert_path_allowed(path, write=False, purpose="summarize_evt")
         if not path.exists():
             return self.wrap({"error": "file not found"})
         lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -1024,7 +1204,8 @@ class MCPServer:
         )
 
     def tail_text_file(self, args):
-        path = Path(args.get("path"))
+        path = Path(self.require_str(args, "path"))
+        self.assert_path_allowed(path, write=False, purpose="tail_text_file")
         if not path.exists():
             return self.wrap({"error": "file not found"})
         line_count = int(args.get("lines") or 50)
@@ -1083,21 +1264,256 @@ class MCPServer:
     def now(self):
         return datetime.now(timezone.utc).isoformat()
 
+    def env_truthy(self, value) -> bool:
+        if value is None:
+            return False
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+    def require_str(self, args, key: str, *, allow_empty: bool = False) -> str:
+        if not isinstance(args, dict):
+            raise JsonRpcError(-32602, "Invalid params", {"reason": "arguments must be an object"})
+        if key not in args:
+            raise JsonRpcError(-32602, "Invalid params", {"reason": f"missing required field: {key}"})
+        value = args.get(key)
+        if not isinstance(value, str):
+            raise JsonRpcError(-32602, "Invalid params", {"reason": f"{key} must be a string"})
+        if not allow_empty and value.strip() == "":
+            raise JsonRpcError(-32602, "Invalid params", {"reason": f"{key} must be non-empty"})
+        return value
+
+    def require_list_of_str(self, args, key: str) -> list:
+        if not isinstance(args, dict):
+            raise JsonRpcError(-32602, "Invalid params", {"reason": "arguments must be an object"})
+        if key not in args:
+            raise JsonRpcError(-32602, "Invalid params", {"reason": f"missing required field: {key}"})
+        value = args.get(key)
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise JsonRpcError(-32602, "Invalid params", {"reason": f"{key} must be an array of strings"})
+        return value
+
+    def safe_resolve(self, path: Path) -> Path:
+        try:
+            return Path(path).expanduser().resolve(strict=False)
+        except Exception:
+            return Path(path)
+
+    def get_allowed_roots(self, *, write: bool) -> list[Path]:
+        if self.env_truthy(os.environ.get("AFSIM_MCP_ALLOW_ANY_PATH")):
+            return []
+
+        roots: list[Path] = []
+        roots.append(self.state_dir)
+
+        project_root = self.resolve_project_root()
+        if project_root:
+            roots.append(project_root)
+
+        demos_root = self.resolve_demos_root()
+        if demos_root:
+            roots.append(demos_root)
+
+        if not write:
+            afsim_root = self.resolve_afsim_root()
+            if afsim_root:
+                roots.append(afsim_root)
+
+        extra = os.environ.get("AFSIM_MCP_EXTRA_PATHS")
+        if extra:
+            for raw in str(extra).split(";"):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                p = Path(raw)
+                if p.exists():
+                    roots.append(p)
+
+        unique: list[Path] = []
+        seen = set()
+        for r in roots:
+            rr = str(self.safe_resolve(r))
+            if rr not in seen:
+                unique.append(Path(rr))
+                seen.add(rr)
+        return unique
+
+    def assert_path_allowed(self, path: Path, *, write: bool, purpose: str):
+        if self.env_truthy(os.environ.get("AFSIM_MCP_ALLOW_ANY_PATH")):
+            return
+
+        resolved = self.safe_resolve(path)
+        roots = self.get_allowed_roots(write=write)
+        for root in roots:
+            root_resolved = self.safe_resolve(root)
+            try:
+                if resolved.is_relative_to(root_resolved):
+                    return
+            except Exception:
+                try:
+                    resolved.relative_to(root_resolved)
+                    return
+                except Exception:
+                    pass
+        raise JsonRpcError(
+            -32602,
+            "Path not allowed",
+            {
+                "purpose": purpose,
+                "path": str(path),
+                "write": write,
+                "allowed_roots": [str(r) for r in roots],
+                "hint": "Set AFSIM_MCP_ALLOW_ANY_PATH=1 to disable path restrictions (not recommended).",
+            },
+        )
+
     def wrap(self, payload):
         return {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]}
 
-    def run_process(self, cmd, working_dir):
-        result = run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=working_dir if working_dir else None,
-        )
+    def truncate_text(self, text: str, max_chars: int) -> str:
+        if text is None:
+            return ""
+        if max_chars is None or max_chars <= 0:
+            return text
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars] + "\n...<truncated>\n"
+
+    def start_background_process(self, cmd, working_dir, *, env=None):
+        process_id = str(uuid.uuid4())
+        stdout_path = self.processes_dir / f"{process_id}.stdout.txt"
+        stderr_path = self.processes_dir / f"{process_id}.stderr.txt"
+
+        stdout_fh = stdout_path.open("w", encoding="utf-8", errors="ignore")
+        stderr_fh = stderr_path.open("w", encoding="utf-8", errors="ignore")
+        try:
+            proc = Popen(
+                cmd,
+                cwd=working_dir if working_dir else None,
+                stdout=stdout_fh,
+                stderr=stderr_fh,
+                stdin=DEVNULL,
+                text=True,
+                env=env,
+            )
+        except Exception:
+            stdout_fh.close()
+            stderr_fh.close()
+            raise
+
+        record = {
+            "process_id": process_id,
+            "pid": proc.pid,
+            "cmd": [str(c) for c in cmd],
+            "working_dir": str(working_dir) if working_dir else None,
+            "start_time": self.now(),
+            "end_time": None,
+            "status": "running",
+            "returncode": None,
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+        }
+        self._processes[process_id] = {
+            "popen": proc,
+            "stdout_fh": stdout_fh,
+            "stderr_fh": stderr_fh,
+            "record": record,
+        }
+        self.write_json(self.processes_dir / f"{process_id}.json", record)
+        return record
+
+    def get_process_status(self, args):
+        process_id = self.require_str(args, "process_id")
+        item = self._processes.get(process_id)
+        record_path = self.processes_dir / f"{process_id}.json"
+
+        if not item:
+            if record_path.exists():
+                record = self.read_json(record_path)
+                record.setdefault("note", "process not in memory (server may have restarted)")
+                return self.wrap(record)
+            raise JsonRpcError(-32602, "Unknown process_id", {"process_id": process_id})
+
+        proc = item["popen"]
+        rc = proc.poll()
+        record = item["record"]
+        if rc is None:
+            record["status"] = "running"
+            record["returncode"] = None
+        else:
+            record["status"] = "completed" if rc == 0 else "failed"
+            record["returncode"] = rc
+            record["end_time"] = self.now()
+            try:
+                item["stdout_fh"].close()
+            except Exception:
+                pass
+            try:
+                item["stderr_fh"].close()
+            except Exception:
+                pass
+            self._processes.pop(process_id, None)
+        self.write_json(record_path, record)
+        return self.wrap(record)
+
+    def stop_process(self, args):
+        process_id = self.require_str(args, "process_id")
+        item = self._processes.get(process_id)
+        if not item:
+            raise JsonRpcError(-32602, "Unknown process_id", {"process_id": process_id})
+
+        proc = item["popen"]
+        stopped = False
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+            stopped = True
+        finally:
+            try:
+                item["stdout_fh"].close()
+            except Exception:
+                pass
+            try:
+                item["stderr_fh"].close()
+            except Exception:
+                pass
+            self._processes.pop(process_id, None)
+
+        record_path = self.processes_dir / f"{process_id}.json"
+        if record_path.exists():
+            record = self.read_json(record_path)
+            record["status"] = "stopped"
+            record["end_time"] = self.now()
+            self.write_json(record_path, record)
+        return self.wrap({"process_id": process_id, "stopped": stopped})
+
+    def run_process(self, cmd, working_dir, *, timeout_sec=None, max_output_chars=20000, background=False, env=None):
+        if background:
+            record = self.start_background_process(cmd, working_dir, env=env)
+            return self.wrap(record)
+
+        try:
+            result = run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=working_dir if working_dir else None,
+                timeout=timeout_sec if timeout_sec else None,
+                env=env,
+            )
+        except TimeoutExpired:
+            raise JsonRpcError(
+                -32001,
+                "Process timeout",
+                {"cmd": [str(c) for c in cmd], "working_dir": working_dir, "timeout_sec": timeout_sec},
+            )
+
         return self.wrap(
             {
                 "returncode": result.returncode,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
+                "stdout": self.truncate_text(result.stdout, int(max_output_chars) if max_output_chars else 0),
+                "stderr": self.truncate_text(result.stderr, int(max_output_chars) if max_output_chars else 0),
             }
         )
 
@@ -1146,7 +1562,11 @@ class MCPServer:
         log_print and iout_print default to false so LOG.N / IOUT.N files
         are NOT generated. Paste into the entry-point scenario file.
         """
-        text = (
+        text = self.build_observer_block_text()
+        return self.wrap({"text": text})
+
+    def build_observer_block_text(self) -> str:
+        return (
             "$define REP 1\n"
             "\n"
             "script_variables\n"
@@ -1170,15 +1590,11 @@ class MCPServer:
             "include_once observer.txt\n"
             "include_once sensor_observer.txt\n"
         )
-        return self.wrap({"text": text})
 
-    def generate_basic_scenario_text(
-        self, aircraft_count, tank_count, side, duration_min, center_lat, center_lon
+    def generate_basic_scenario_entities_text(
+        self, aircraft_count, tank_count, side, center_lat, center_lon
     ):
         lines = []
-        lines.append("realtime")
-        lines.append(f"end_time {duration_min} min")
-        lines.append("")
         for idx in range(aircraft_count):
             lat = center_lat + 0.01 * idx
             lon = center_lon + 0.01 * idx
@@ -1214,6 +1630,22 @@ class MCPServer:
             lines.append("   end_mover")
             lines.append("end_platform")
             lines.append("")
+        return "\n".join(lines).strip() + "\n"
+
+    def generate_basic_entrypoint_text(self, scenario_name: str, duration_min: float) -> str:
+        scenario_name = str(scenario_name)
+        lines = []
+        lines.append("file_path .")
+        lines.append("realtime")
+        lines.append(f"end_time {duration_min} min")
+        lines.append("")
+        lines.append(self.build_observer_block_text().rstrip())
+        lines.append("")
+        lines.append(f"include_once scenarios/{scenario_name}.txt")
+        lines.append("event_pipe")
+        lines.append("   enable AIRCOMBAT")
+        lines.append("end_event_pipe")
+        lines.append("")
         return "\n".join(lines).strip() + "\n"
 
     def format_lat_lon(self, lat, lon):
