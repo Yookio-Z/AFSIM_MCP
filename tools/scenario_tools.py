@@ -240,6 +240,134 @@ def specs():
             },
         },
         {
+            "name": "refine_operational_prompt",
+            "description": (
+                "Normalize a user prompt into an operational brief before scenario generation. "
+                "The tool infers scenario type, likely theater center, duration, replay focus, KPI targets, "
+                "force-package guidance, and a recommended operational model that can be passed into scenario generation."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "scenario_name": {"type": "string"},
+                    "operational_model": {"type": "object"},
+                    "duration_min": {"type": "number"},
+                    "center": {
+                        "type": "object",
+                        "properties": {
+                            "lat": {"type": "number"},
+                            "lon": {"type": "number"}
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "name": "create_operational_scenario_package",
+            "description": (
+                "Generate a domain-model-driven AFSIM scenario package. "
+                "The tool first resolves mission objectives, force packages, phases, and engagement rules, "
+                "then writes a scenario directory with entry-point text, laydown text, and scenario briefing docs. "
+                "When project_brief_path is provided (or legacy project_plan_path), generation follows the reviewed brief."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "output_path": {"type": "string"},
+                    "project_dir": {"type": "string"},
+                    "project_brief_path": {"type": "string"},
+                    "project_plan_path": {"type": "string"},
+                    "operational_model": {"type": "object"},
+                    "duration_min": {"type": "number"},
+                    "center": {
+                        "type": "object",
+                        "properties": {
+                            "lat": {"type": "number"},
+                            "lon": {"type": "number"},
+                        },
+                    },
+                    "refine_prompt": {"type": "boolean"},
+                    "generate_project_brief": {"type": "boolean"},
+                    "generate_project_plan": {"type": "boolean"},
+                    "generate_showcase": {"type": "boolean"},
+                },
+                "required": ["output_path"],
+            },
+        },
+        {
+            "name": "prepare_operational_project_plan",
+            "description": (
+                "Generate only the project briefing artifacts for an operational scenario (no mission generation/run). "
+                "Writes doc/PROJECT_BRIEF.md + doc/PROMPT_BRIEF.md + model JSON so users can review/edit before generation."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "output_path": {"type": "string"},
+                    "project_dir": {"type": "string"},
+                    "operational_model": {"type": "object"},
+                    "duration_min": {"type": "number"},
+                    "center": {
+                        "type": "object",
+                        "properties": {
+                            "lat": {"type": "number"},
+                            "lon": {"type": "number"},
+                        },
+                    },
+                },
+                "required": ["output_path"],
+            },
+        },
+        {
+            "name": "create_validated_operational_scenario_package",
+            "description": (
+                "Generate an operational scenario package, then autonomously validate it by running mission. "
+                "If validation fails, the tool retries with a stricter generated-asset strategy. "
+                "By default, after mission succeeds it opens Wizard automatically, and returns attempt diagnostics, "
+                "latest AER path, Wizard result, and optional output analysis. "
+                "When mission reports syntax/definition/include issues, the tool applies automatic repairs and reruns mission up to a bounded retry limit. "
+                "When project_brief_path is provided (or legacy project_plan_path), generation follows the reviewed brief."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "output_path": {"type": "string"},
+                    "project_dir": {"type": "string"},
+                    "project_brief_path": {"type": "string"},
+                    "project_plan_path": {"type": "string"},
+                    "operational_model": {"type": "object"},
+                    "duration_min": {"type": "number"},
+                    "center": {
+                        "type": "object",
+                        "properties": {
+                            "lat": {"type": "number"},
+                            "lon": {"type": "number"},
+                        },
+                    },
+                    "refine_prompt": {"type": "boolean"},
+                    "generate_project_brief": {"type": "boolean"},
+                    "generate_project_plan": {"type": "boolean"},
+                    "generate_showcase": {"type": "boolean"},
+                    "run_after_generate": {"type": "boolean"},
+                    "analyze_after_run": {"type": "boolean"},
+                    "auto_open_wizard": {"type": "boolean"},
+                    "wizard_background": {"type": "boolean"},
+                    "wizard_timeout_sec": {"type": "number"},
+                    "auto_open_mystic": {"type": "boolean"},
+                    "auto_repair_on_failure": {"type": "boolean"},
+                    "max_auto_repairs_per_attempt": {"type": "integer"},
+                    "mission_timeout_sec": {"type": "number"},
+                    "max_output_chars": {"type": "integer"},
+                    "max_iterations": {"type": "integer"},
+                },
+                "required": ["output_path"],
+            },
+        },
+        {
             "name": "init_project_structure",
             "description": "Initialize a standard project folder structure.",
             "inputSchema": {
@@ -279,6 +407,23 @@ def specs():
             ),
             "inputSchema": {"type": "object", "properties": {}},
         },
+        {
+            "name": "build_showcase_package",
+            "description": (
+                "Build a presentation-ready showcase package for a scenario directory, including briefing, replay plan, "
+                "speaker notes, and a manifest that references key playback moments and analysis outputs."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "scenario_dir": {"type": "string"},
+                    "analysis_path": {"type": "string"},
+                    "model_path": {"type": "string"},
+                    "briefing_title": {"type": "string"},
+                },
+                "required": ["scenario_dir"],
+            },
+        },
     ]
 
 
@@ -304,8 +449,13 @@ def router(server):
         "generate_mover_template": server.generate_mover_template,
         "list_project_structure_template": lambda _: server.list_project_structure_template(),
         "generate_project_structure_overview": server.generate_project_structure_overview,
+        "refine_operational_prompt": server.refine_operational_prompt,
+        "create_operational_scenario_package": server.create_operational_scenario_package,
+        "prepare_operational_project_plan": server.prepare_operational_project_plan,
+        "create_validated_operational_scenario_package": server.create_validated_operational_scenario_package,
         "init_project_structure": server.init_project_structure,
         "set_paths_config": server.set_paths_config,
         "get_paths_config": server.get_paths_config,
         "get_observer_block": lambda _: server.get_observer_block(),
+        "build_showcase_package": server.build_showcase_package,
     }

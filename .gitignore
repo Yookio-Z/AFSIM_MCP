@@ -201,6 +201,21 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# MCP runtime state
+mcp_state/**
+!mcp_state/
+
+# AFSIM runtime artifacts
+*.aer
+*.evt
+mission.log
+wizard.log
+*.stdout.txt
+*.stderr.txt
+LOG.*
+IOUT.*
+SENSOR.*
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

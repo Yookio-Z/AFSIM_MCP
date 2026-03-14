@@ -1,9 +1,9 @@
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from subprocess import DEVNULL, Popen, TimeoutExpired, run
 
 # 标准 AFSIM 项目目录结构 —— 每次写出场景文件时强制创建
 STANDARD_PROJECT_DIRS = [
@@ -18,8 +18,24 @@ STANDARD_PROJECT_DIRS = [
 
 try:
     from ..tools import build_tool_router, build_tool_specs
+    from .analysis import AnalysisService
+    from .assets import AssetService
+    from .generation import GenerationService
+    from .planning import PlanningService
+    from .results import ResultsService
+    from .runtime import RuntimeService
+    from .scenario_ops import ScenarioOpsService
+    from .showcase import ShowcaseService
 except ImportError:
     from tools import build_tool_router, build_tool_specs
+    from core.analysis import AnalysisService
+    from core.assets import AssetService
+    from core.generation import GenerationService
+    from core.planning import PlanningService
+    from core.results import ResultsService
+    from core.runtime import RuntimeService
+    from core.scenario_ops import ScenarioOpsService
+    from core.showcase import ShowcaseService
 
 
 class JsonRpcError(Exception):
@@ -37,14 +53,18 @@ class JsonRpcError(Exception):
 
 
 class MCPServer:
+    JsonRpcError = JsonRpcError
+    STANDARD_PROJECT_DIRS = STANDARD_PROJECT_DIRS
+
     def __init__(self):
         self.base_dir = self.resolve_base_dir()
+        self.config_dir = self.resolve_config_dir()
+        self.config_path = self.config_dir / "config.json"
         self.state_dir = self.resolve_state_dir()
         self.scenarios_dir = self.state_dir / "scenarios"
         self.runs_dir = self.state_dir / "runs"
         self.results_dir = self.state_dir / "results"
         self.processes_dir = self.state_dir / "processes"
-        self.config_path = self.state_dir / "config.json"
         self.scenarios_dir.mkdir(parents=True, exist_ok=True)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.results_dir.mkdir(parents=True, exist_ok=True)
@@ -53,6 +73,14 @@ class MCPServer:
         self._tool_specs = build_tool_specs()
         self._tool_router = build_tool_router(self)
         self._processes = {}
+        self.analysis_service = AnalysisService(self)
+        self.asset_service = AssetService(self)
+        self.generation_service = GenerationService(self)
+        self.planning_service = PlanningService(self)
+        self.results_service = ResultsService(self)
+        self.runtime_service = RuntimeService(self)
+        self.scenario_ops_service = ScenarioOpsService(self)
+        self.showcase_service = ShowcaseService(self)
 
     def resolve_base_dir(self):
         env_dir = os.environ.get("AFSIM_MCP_BASE_DIR")
@@ -63,11 +91,30 @@ class MCPServer:
             return file_path.parents[3]
         return file_path.parents[1]
 
+    def resolve_config_dir(self):
+        env_dir = os.environ.get("AFSIM_MCP_CONFIG_DIR")
+        if env_dir:
+            return Path(env_dir)
+        legacy_dir = os.environ.get("AFSIM_MCP_STATE_DIR")
+        if legacy_dir:
+            return Path(legacy_dir)
+        return Path.home() / ".afsim_mcp"
+
     def resolve_state_dir(self):
         env_dir = os.environ.get("AFSIM_MCP_STATE_DIR")
         if env_dir:
             return Path(env_dir)
-        return self.base_dir / "mcp_state"
+        config = self.read_config()
+        cfg_state = config.get("state_dir")
+        if cfg_state and Path(cfg_state).exists():
+            return Path(cfg_state)
+        env_project = os.environ.get("AFSIM_PROJECT_ROOT")
+        if env_project and Path(env_project).exists():
+            return Path(env_project) / "mcp_state"
+        cfg_root = config.get("project_root")
+        if cfg_root and Path(cfg_root).exists():
+            return Path(cfg_root) / "mcp_state"
+        return self.config_dir / "state"
 
     def resolve_afsim_root(self):
         env_root = os.environ.get("AFSIM_ROOT")
@@ -529,626 +576,100 @@ class MCPServer:
         return self.wrap({"text": text})
 
     def list_project_structure_template(self):
-        return self.wrap(
-            {
-                "directories": [
-                    {"name": "doc",        "description": "文档、说明与参考资料"},
-                    {"name": "output",     "description": "运行时输出日志、事件与 AER 文件（勿手动编辑）"},
-                    {"name": "platforms",  "description": "平台与平台类型定义（platform_type）"},
-                    {"name": "processors", "description": "处理器与脚本定义"},
-                    {"name": "scenarios",  "description": "场景平台实例 + 航路定义（被入口文件 include）"},
-                    {"name": "sensors",    "description": "传感器定义"},
-                    {"name": "weapons",    "description": "武器定义"},
-                ],
-                "entry_file_convention": (
-                    "<scenario_name>.txt 放在场景根目录（file_path/event_pipe/end_time），"
-                    "平台实例文件放在 scenarios/<scenario_name>.txt，"
-                    "与官方 air_to_air demo 结构一致"
-                ),
-                "notes": [
-                    "每个场景拥有独立的具名子目录 <project_root>/<scenario_name>/",
-                    "write_scenario_text / create_scenario_from_prompt 会自动强制此结构",
-                    "入口文件用 file_path . 使所有相对路径从该目录解析",
-                ],
-            }
-        )
+        return self.scenario_ops_service.list_project_structure_template()
 
     def generate_project_structure_overview(self, args):
-        project_name = args.get("project_name") or "scenarioName"
-        lines = [
-            f"<project_root>/{project_name}/          ← 场景独立根目录",
-            f"  {project_name}.txt                    ← 入口文件（file_path/event_pipe/end_time）",
-            f"  doc/                                  ← 文档",
-            f"  output/                               ← 仿真输出 (.aer/.evt/.log)",
-            f"  platforms/                            ← platform_type 定义",
-            f"  processors/                           ← 处理器脚本",
-            f"  scenarios/",
-            f"    {project_name}.txt                  ← 平台实例 + 航路（被入口 include）",
-            f"  sensors/                              ← 传感器定义",
-            f"  weapons/                              ← 武器定义",
-        ]
-        text = "\n".join(lines) + "\n"
-        return self.wrap({"text": text})
+        return self.scenario_ops_service.generate_project_structure_overview(args)
 
     def init_project_structure(self, args):
-        base_dir = args.get("base_dir")
-        if not base_dir:
-            root = self.resolve_project_root()
-            if root:
-                base_dir = str(root)
-        if not base_dir:
-            return self.wrap({"error": "base_dir is required"})
-        project_name = args.get("project_name")
-        target = Path(base_dir)
-        if project_name:
-            target = target / project_name
-        target.mkdir(parents=True, exist_ok=True)
-        directories = args.get("directories")
-        if directories is None:
-            # 使用强制标准目录（与 ensure_project_structure 保持一致）
-            directories = list(STANDARD_PROJECT_DIRS)
-        created = []
-        for name in directories:
-            if not name:
-                continue
-            path = target / name
-            path.mkdir(parents=True, exist_ok=True)
-            created.append(str(path))
-        return self.wrap({"project_dir": str(target), "directories": created})
+        return self.scenario_ops_service.init_project_structure(args)
 
     def run_simulation(self, args):
-        scenario_id = args["scenario_id"]
-        run_id = str(uuid.uuid4())
-        scenario_path = self.scenario_path(scenario_id)
-        run_data = {
-            "id": run_id,
-            "scenario_id": scenario_id,
-            "status": "created",
-            "start_time": self.now(),
-            "end_time": None,
-            "outputs": {},
-            "run_config": args.get("run_config") or {},
-        }
-        cmd_template = os.environ.get("AFSIM_RUN_CMD")
-        if cmd_template:
-            cmd = cmd_template.format(
-                scenario_id=scenario_id,
-                scenario_path=str(scenario_path),
-                run_id=run_id,
-            )
-            result = run(cmd, shell=True, capture_output=True, text=True)
-            run_data["outputs"] = {
-                "returncode": result.returncode,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-            }
-            run_data["status"] = "completed" if result.returncode == 0 else "failed"
-            run_data["end_time"] = self.now()
-        else:
-            run_data["status"] = "pending_backend"
-        self.write_json(self.run_path(run_id), run_data)
-        return self.wrap({"run_id": run_id, "status": run_data["status"]})
+        return self.results_service.run_simulation(args)
 
     def stop_simulation(self, args):
-        return self.wrap({"stopped": False, "reason": "backend_not_connected"})
+        return self.results_service.stop_simulation(args)
 
     def get_simulation_status(self, args):
-        run_data = self.read_json(self.run_path(args["run_id"]))
-        return self.wrap(
-            {
-                "run_id": run_data["id"],
-                "status": run_data["status"],
-                "start_time": run_data["start_time"],
-                "end_time": run_data["end_time"],
-            }
-        )
+        return self.results_service.get_simulation_status(args)
 
     def list_results(self, args):
-        scenario_id = args["scenario_id"]
-        runs = self.get_runs(scenario_id)
-        return self.wrap({"runs": runs})
+        return self.results_service.list_results(args)
 
     def export_results(self, args):
-        scenario_id = args["scenario_id"]
-        fmt = args["format"]
-        runs_data = self.get_runs(scenario_id)
-        if "path" in args and args["path"]:
-            out_path = Path(args["path"])
-        else:
-            out_path = self.results_dir / f"{scenario_id}.{fmt}"
-        if fmt == "json":
-            self.write_json(out_path, runs_data)
-        elif fmt == "csv":
-            import csv
-
-            with out_path.open("w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(
-                    f, fieldnames=["run_id", "status", "start_time", "end_time"]
-                )
-                writer.writeheader()
-                writer.writerows(runs_data)
-        else:
-            return self.wrap({"error": "format must be csv or json"})
-        return self.wrap({"file_path": str(out_path)})
+        return self.results_service.export_results(args)
 
     def query_results(self, args):
-        scenario_id = args["scenario_id"]
-        query = args["query"]
-        matches = []
-        for data in self.get_run_records(scenario_id):
-            text = json.dumps(data, ensure_ascii=False)
-            if query in text:
-                matches.append({"run_id": data.get("id"), "status": data.get("status")})
-        return self.wrap({"matches": matches})
+        return self.results_service.query_results(args)
 
     def set_afsim_bin(self, args):
-        path = Path(args["path"])
-        if not path.exists():
-            return self.wrap({"error": "path not found"})
-        config = self.read_config()
-        config["afsim_bin"] = str(path)
-        self.write_config(config)
-        return self.wrap({"afsim_bin": str(path)})
+        return self.runtime_service.set_afsim_bin(args)
 
     def get_afsim_bin(self):
-        config = self.read_config()
-        return self.wrap({"afsim_bin": config.get("afsim_bin")})
+        return self.runtime_service.get_afsim_bin()
 
     def set_paths_config(self, args):
-        config = self.read_config()
-        updates = {
-            "afsim_root": args.get("afsim_root"),
-            "project_root": args.get("project_root"),
-            "demos_root": args.get("demos_root"),
-            "afsim_bin": args.get("afsim_bin"),
-        }
-        for key, value in updates.items():
-            if not value:
-                continue
-            path = Path(value)
-            if not path.exists():
-                return self.wrap({"error": "path not found", "key": key, "path": str(path)})
-            config[key] = str(path)
-        self.write_config(config)
-        return self.wrap({"config": config})
+        return self.runtime_service.set_paths_config(args)
 
     def get_paths_config(self, args):
-        config = self.read_config()
-        resolved_afsim_root = self.resolve_afsim_root()
-        resolved_project_root = self.resolve_project_root()
-        resolved_demos_root = self.resolve_demos_root()
-        resolved_bin = self.resolve_bin_path()
-        return self.wrap(
-            {
-                "config_path": str(self.config_path),
-                "config": config,
-                "resolved": {
-                    "afsim_root": str(resolved_afsim_root) if resolved_afsim_root else None,
-                    "project_root": str(resolved_project_root) if resolved_project_root else None,
-                    "demos_root": str(resolved_demos_root) if resolved_demos_root else None,
-                    "afsim_bin": str(resolved_bin) if resolved_bin else None,
-                    "state_dir": str(self.state_dir),
-                },
-            }
-        )
+        return self.runtime_service.get_paths_config(args)
 
     def run_wizard(self, args):
-        wizard_path = self.resolve_wizard_path()
-        if not wizard_path:
-            raise JsonRpcError(-32002, "wizard executable not found", {"tool": "run_wizard"})
-        cmd = [str(wizard_path)]
-        if args.get("console", True):
-            cmd.append("-console")
-        raw_args = args.get("args") or []
-        if isinstance(raw_args, list):
-            cmd.extend([str(a) for a in raw_args])
-        else:
-            cmd.append(str(raw_args))
-        working_dir = args.get("working_dir")
-        if working_dir:
-            self.assert_path_allowed(Path(working_dir), write=True, purpose="run_wizard(working_dir)")
-        timeout_sec = args.get("timeout_sec")
-        background = bool(args.get("background", False))
-        max_output_chars = args.get("max_output_chars")
-        return self.run_process(
-            cmd,
-            working_dir,
-            timeout_sec=float(timeout_sec) if timeout_sec else None,
-            background=background,
-            max_output_chars=int(max_output_chars) if max_output_chars else 20000,
-        )
+        return self.runtime_service.run_wizard(args)
 
     def run_mission(self, args):
-        exe = self.resolve_exe("mission")
-        if not exe:
-            raise JsonRpcError(-32002, "mission executable not found", {"tool": "run_mission"})
-        scenario = self.require_str(args, "scenario")
-        scenario_path = Path(scenario)
-        self.assert_path_allowed(scenario_path, write=False, purpose="run_mission(scenario)")
-        working_dir = args.get("working_dir")
-        if working_dir:
-            self.assert_path_allowed(Path(working_dir), write=True, purpose="run_mission(working_dir)")
-        else:
-            working_dir = str(scenario_path.parent)
-            self.assert_path_allowed(Path(working_dir), write=True, purpose="run_mission(default_working_dir)")
-        timeout_sec = args.get("timeout_sec")
-        background = bool(args.get("background", False))
-        max_output_chars = args.get("max_output_chars")
-        cmd = [str(exe), str(scenario_path)]
-        return self.run_process(
-            cmd,
-            working_dir,
-            timeout_sec=float(timeout_sec) if timeout_sec else None,
-            background=background,
-            max_output_chars=int(max_output_chars) if max_output_chars else 20000,
-        )
+        return self.runtime_service.run_mission(args)
 
     def run_mission_with_args(self, args):
-        exe = self.resolve_exe("mission")
-        if not exe:
-            raise JsonRpcError(-32002, "mission executable not found", {"tool": "run_mission_with_args"})
-        scenario = self.require_str(args, "scenario")
-        scenario_path = Path(scenario)
-        self.assert_path_allowed(scenario_path, write=False, purpose="run_mission_with_args(scenario)")
-        raw_args = args.get("args") or []
-        cmd = [str(exe), str(scenario_path)]
-        if isinstance(raw_args, list):
-            cmd.extend([str(a) for a in raw_args])
-        else:
-            cmd.append(str(raw_args))
-        working_dir = args.get("working_dir")
-        if working_dir:
-            self.assert_path_allowed(Path(working_dir), write=True, purpose="run_mission_with_args(working_dir)")
-        else:
-            working_dir = str(scenario_path.parent)
-            self.assert_path_allowed(Path(working_dir), write=True, purpose="run_mission_with_args(default_working_dir)")
-        timeout_sec = args.get("timeout_sec")
-        background = bool(args.get("background", False))
-        max_output_chars = args.get("max_output_chars")
-        return self.run_process(
-            cmd,
-            working_dir,
-            timeout_sec=float(timeout_sec) if timeout_sec else None,
-            background=background,
-            max_output_chars=int(max_output_chars) if max_output_chars else 20000,
-        )
+        return self.runtime_service.run_mission_with_args(args)
 
     def run_warlock(self, args):
-        exe = self.resolve_exe("warlock")
-        if not exe:
-            raise JsonRpcError(-32002, "warlock executable not found", {"tool": "run_warlock"})
-        cmd = [str(exe)]
-        raw_args = args.get("args") or []
-        if isinstance(raw_args, list):
-            cmd.extend([str(a) for a in raw_args])
-        else:
-            cmd.append(str(raw_args))
-        working_dir = args.get("working_dir")
-        if working_dir:
-            self.assert_path_allowed(Path(working_dir), write=True, purpose="run_warlock(working_dir)")
-        timeout_sec = args.get("timeout_sec")
-        background = bool(args.get("background", False))
-        max_output_chars = args.get("max_output_chars")
-        return self.run_process(
-            cmd,
-            working_dir,
-            timeout_sec=float(timeout_sec) if timeout_sec else None,
-            background=background,
-            max_output_chars=int(max_output_chars) if max_output_chars else 20000,
-        )
+        return self.runtime_service.run_warlock(args)
 
     def run_mystic(self, args):
-        exe = self.resolve_exe("mystic")
-        if not exe:
-            raise JsonRpcError(-32002, "mystic executable not found", {"tool": "run_mystic"})
-        cmd = [str(exe)]
-        recording = args.get("recording")
-        if recording:
-            rec_path = Path(str(recording))
-            self.assert_path_allowed(rec_path, write=False, purpose="run_mystic(recording)")
-            cmd.append(str(rec_path))
-        working_dir = args.get("working_dir")
-        if working_dir:
-            self.assert_path_allowed(Path(working_dir), write=True, purpose="run_mystic(working_dir)")
-        timeout_sec = args.get("timeout_sec")
-        background = bool(args.get("background", False))
-        max_output_chars = args.get("max_output_chars")
-        return self.run_process(
-            cmd,
-            working_dir,
-            timeout_sec=float(timeout_sec) if timeout_sec else None,
-            background=background,
-            max_output_chars=int(max_output_chars) if max_output_chars else 20000,
-        )
+        return self.runtime_service.run_mystic(args)
 
     def run_engage(self, args):
-        exe = self.resolve_exe("engage")
-        if not exe:
-            raise JsonRpcError(-32002, "engage executable not found", {"tool": "run_engage"})
-        cmd = [str(exe)]
-        raw_args = args.get("args") or []
-        if isinstance(raw_args, list):
-            cmd.extend([str(a) for a in raw_args])
-        else:
-            cmd.append(str(raw_args))
-        working_dir = args.get("working_dir")
-        if working_dir:
-            self.assert_path_allowed(Path(working_dir), write=True, purpose="run_engage(working_dir)")
-        timeout_sec = args.get("timeout_sec")
-        background = bool(args.get("background", False))
-        max_output_chars = args.get("max_output_chars")
-        return self.run_process(
-            cmd,
-            working_dir,
-            timeout_sec=float(timeout_sec) if timeout_sec else None,
-            background=background,
-            max_output_chars=int(max_output_chars) if max_output_chars else 20000,
-        )
+        return self.runtime_service.run_engage(args)
 
     def run_sensor_plot(self, args):
-        exe = self.resolve_exe("sensor_plot")
-        if not exe:
-            raise JsonRpcError(-32002, "sensor_plot executable not found", {"tool": "run_sensor_plot"})
-        cmd = [str(exe)]
-        raw_args = args.get("args") or []
-        if isinstance(raw_args, list):
-            cmd.extend([str(a) for a in raw_args])
-        else:
-            cmd.append(str(raw_args))
-        working_dir = args.get("working_dir")
-        if working_dir:
-            self.assert_path_allowed(Path(working_dir), write=True, purpose="run_sensor_plot(working_dir)")
-        timeout_sec = args.get("timeout_sec")
-        background = bool(args.get("background", False))
-        max_output_chars = args.get("max_output_chars")
-        return self.run_process(
-            cmd,
-            working_dir,
-            timeout_sec=float(timeout_sec) if timeout_sec else None,
-            background=background,
-            max_output_chars=int(max_output_chars) if max_output_chars else 20000,
-        )
+        return self.runtime_service.run_sensor_plot(args)
 
     def batch_run_mission(self, args):
-        exe = self.resolve_exe("mission")
-        if not exe:
-            raise JsonRpcError(-32002, "mission executable not found", {"tool": "batch_run_mission"})
-        scenarios = args.get("scenarios") or []
-        if not isinstance(scenarios, list) or not all(isinstance(s, str) for s in scenarios):
-            raise JsonRpcError(-32602, "Invalid params", {"reason": "scenarios must be an array of strings"})
-        working_dir = args.get("working_dir")
-        if working_dir:
-            self.assert_path_allowed(Path(working_dir), write=True, purpose="batch_run_mission(working_dir)")
-        results = []
-        for scenario in scenarios:
-            self.assert_path_allowed(Path(scenario), write=False, purpose="batch_run_mission(scenario)")
-            result = run(
-                [str(exe), str(scenario)],
-                capture_output=True,
-                text=True,
-                cwd=working_dir if working_dir else None,
-            )
-            results.append(
-                {
-                    "scenario": str(scenario),
-                    "returncode": result.returncode,
-                    "stdout": result.stdout,
-                    "stderr": result.stderr,
-                }
-            )
-        return self.wrap({"results": results})
+        return self.runtime_service.batch_run_mission(args)
 
     def run_mission_and_open_mystic(self, args):
-        scenario = self.require_str(args, "scenario")
-        scenario_path = Path(scenario)
-        self.assert_path_allowed(scenario_path, write=False, purpose="run_mission_and_open_mystic(scenario)")
-        working_dir = args.get("working_dir")
-        open_mystic = args.get("open_mystic")
-        if open_mystic is None:
-            open_mystic = True
-        working_root = Path(working_dir) if working_dir else scenario_path.parent
-        self.assert_path_allowed(working_root, write=True, purpose="run_mission_and_open_mystic(working_dir)")
-        timeout_sec = args.get("timeout_sec")
-        max_output_chars = args.get("max_output_chars")
-        mission_result = self.run_mission(
-            {
-                "scenario": str(scenario_path),
-                "working_dir": str(working_root),
-                "timeout_sec": timeout_sec,
-                "max_output_chars": max_output_chars,
-            }
-        )
-        latest_aer = self.find_latest_aer(working_root)
-        mystic_result = None
-        if open_mystic and latest_aer:
-            mystic_result = self.run_mystic(
-                {"recording": str(latest_aer), "working_dir": str(latest_aer.parent)}
-            )
-        return self.wrap(
-            {
-                "mission": json.loads(mission_result["content"][0]["text"]),
-                "latest_aer": str(latest_aer) if latest_aer else None,
-                "mystic": json.loads(mystic_result["content"][0]["text"])
-                if mystic_result
-                else None,
-            }
-        )
+        return self.runtime_service.run_mission_and_open_mystic(args)
 
     def open_latest_aer_in_mystic(self, args):
-        directory = Path(self.require_str(args, "directory"))
-        self.assert_path_allowed(directory, write=False, purpose="open_latest_aer_in_mystic(directory)")
-        latest_aer = self.find_latest_aer(directory)
-        if not latest_aer:
-            return self.wrap({"error": "no aer files found"})
-        mystic_result = self.run_mystic(
-            {"recording": str(latest_aer), "working_dir": str(latest_aer.parent)}
-        )
-        return self.wrap(
-            {
-                "latest_aer": str(latest_aer),
-                "mystic": json.loads(mystic_result["content"][0]["text"]),
-            }
-        )
+        return self.runtime_service.open_latest_aer_in_mystic(args)
 
     def list_demos(self):
-        demos = self.get_demos_root()
-        if not demos:
-            return self.wrap({"error": "demos folder not found"})
-        folders = sorted([p.name for p in demos.iterdir() if p.is_dir()])
-        return self.wrap({"demos": folders})
+        return self.scenario_ops_service.list_demos()
 
     def list_demo_scenarios(self, args):
-        demos = self.get_demos_root()
-        if not demos:
-            return self.wrap({"error": "demos folder not found"})
-        demo = args.get("demo")
-        if not demo:
-            return self.wrap({"error": "demo is required"})
-        base = demos / demo
-        if not base.exists():
-            return self.wrap({"error": "demo not found"})
-        self.assert_path_allowed(base, write=False, purpose="list_demo_scenarios")
-        scenarios = sorted([str(p) for p in base.rglob("*.txt")])
-        return self.wrap({"scenarios": scenarios})
+        return self.scenario_ops_service.list_demo_scenarios(args)
 
     def suggest_scenario_questions(self, args):
-        prompt = args.get("prompt") or ""
-        counts = self.parse_prompt_counts(prompt)
-        defaults = {
-            "aircraft_count": counts.get("aircraft", 2),
-            "tank_count": counts.get("tank", 2),
-            "side": "blue",
-            "duration_min": 30,
-            "center": {"lat": 21.325, "lon": -158.51},
-        }
-        questions = [
-            {"key": "scenario_name", "question": "场景名称是什么？"},
-            {"key": "mission_goal", "question": "作战目标是什么？"},
-            {"key": "area_center", "question": "作战区域中心坐标（纬度/经度）是多少？"},
-            {"key": "aircraft_type", "question": "飞机平台类型/型号是什么？"},
-            {"key": "tank_type", "question": "坦克平台类型/型号是什么？"},
-            {"key": "duration_min", "question": "仿真时长是多少分钟？"},
-            {"key": "sides", "question": "各平台所属阵营？"},
-        ]
-        return self.wrap({"defaults": defaults, "questions": questions})
+        return self.scenario_ops_service.suggest_scenario_questions(args)
 
     def create_scenario_from_prompt(self, args):
-        prompt = args.get("prompt") or ""
-        output_path = self.require_str(args, "output_path")
-        output = Path(output_path)
-        project_dir = args.get("project_dir")
-        if project_dir and not output.is_absolute():
-            output = Path(project_dir) / output
-        if output.suffix == "":
-            output = output.with_suffix(".txt")
+        return self.scenario_ops_service.create_scenario_from_prompt(args)
 
-        scenario_name = output.stem
+    def create_operational_scenario_package(self, args):
+        return self.scenario_ops_service.create_operational_scenario_package(args)
 
-        # ── 强制场景独立子目录 ─────────────────────────────────────────────────
-        # 输出结构（镜像官方 demo）：
-        #   <project_root>/<scenario_name>/
-        #     <scenario_name>.txt           ← 入口文件（file_path/event_pipe/end_time）
-        #     scenarios/<scenario_name>.txt ← 平台实例 + 航路（被入口 include_once）
-        project_root_p = Path(project_dir) if project_dir else None
-        if not project_root_p:
-            project_root_p = self.resolve_project_root()
+    def prepare_operational_project_plan(self, args):
+        return self.scenario_ops_service.prepare_operational_project_plan(args)
 
-        entry_path = output
-        scenario_root = output.parent
+    def create_validated_operational_scenario_package(self, args):
+        return self.scenario_ops_service.create_validated_operational_scenario_package(args)
 
-        if output.parent.name == "scenarios":
-            scenario_root = output.parent.parent
-            entry_path = scenario_root / f"{scenario_name}.txt"
-        elif output.parent.name in ("platforms", "sensors", "weapons", "processors", "doc", "output"):
-            scenario_root = output.parent.parent
-            entry_path = scenario_root / f"{scenario_name}.txt"
-
-        if project_root_p:
-            pr = Path(project_root_p).resolve()
-            try:
-                rel = entry_path.resolve().relative_to(pr)
-            except ValueError:
-                rel = None
-            if rel is not None and len(rel.parts) == 1:
-                scenario_root = pr / scenario_name
-                entry_path = scenario_root / f"{scenario_name}.txt"
-
-        scenario_file_path = scenario_root / "scenarios" / f"{scenario_name}.txt"
-
-        self.assert_path_allowed(entry_path, write=True, purpose="create_scenario_from_prompt(entry)")
-        self.assert_path_allowed(scenario_file_path, write=True, purpose="create_scenario_from_prompt(scenarios)")
-        self.ensure_project_structure(scenario_root)
-
-        counts = self.parse_prompt_counts(prompt)
-        aircraft_count = int(args.get("aircraft_count") or counts.get("aircraft") or 3)
-        tank_count = int(args.get("tank_count") or counts.get("tank") or 3)
-        side = args.get("side") or "blue"
-        duration_min = float(args.get("duration_min") or 30)
-        center = args.get("center") or {}
-        lat = float(center.get("lat") or 21.325)
-        lon = float(center.get("lon") or -158.51)
-
-        scenarios_text = self.generate_basic_scenario_entities_text(
-            aircraft_count=aircraft_count,
-            tank_count=tank_count,
-            side=side,
-            center_lat=lat,
-            center_lon=lon,
-        )
-        entry_text = self.generate_basic_entrypoint_text(scenario_name=scenario_name, duration_min=duration_min)
-        self.write_text(scenario_file_path, scenarios_text)
-        self.write_text(entry_path, entry_text)
-        return self.wrap(
-            {
-                "path": str(entry_path),
-                "entry_path": str(entry_path),
-                "scenario_path": str(scenario_file_path),
-                "scenario_dir": str(scenario_root),
-                "aircraft_count": aircraft_count,
-                "tank_count": tank_count,
-                "side": side,
-                "duration_min": duration_min,
-            }
-        )
+    def refine_operational_prompt(self, args):
+        return self.scenario_ops_service.refine_operational_prompt(args)
 
     def run_demo(self, args):
-        demos = self.get_demos_root()
-        if not demos:
-            return self.wrap({"error": "demos folder not found"})
-        demo = args.get("demo")
-        scenario = args.get("scenario")
-        if not demo or not scenario:
-            return self.wrap({"error": "demo and scenario are required"})
-        demo_dir = demos / demo
-        if not demo_dir.exists():
-            return self.wrap({"error": "demo not found"})
-        self.assert_path_allowed(demo_dir, write=True, purpose="run_demo(demo_dir)")
-        scenario_path = Path(scenario)
-        if not scenario_path.is_absolute():
-            scenario_path = demo_dir / scenario
-        self.assert_path_allowed(scenario_path, write=False, purpose="run_demo(scenario)")
-        mission_exe = self.resolve_exe("mission")
-        if not mission_exe:
-            raise JsonRpcError(-32002, "mission executable not found", {"tool": "run_demo"})
-        mission_result = self.run_process(
-            [str(mission_exe), str(scenario_path)],
-            str(demo_dir),
-        )
-        latest_aer = self.find_latest_aer(demo_dir)
-        mystic_result = None
-        if args.get("open_mystic") and latest_aer:
-            mystic_result = self.run_mystic(
-                {"recording": str(latest_aer), "working_dir": str(latest_aer.parent)}
-            )
-        return self.wrap(
-            {
-                "mission": json.loads(mission_result["content"][0]["text"]),
-                "latest_aer": str(latest_aer) if latest_aer else None,
-                "mystic": json.loads(mystic_result["content"][0]["text"])
-                if mystic_result
-                else None,
-            }
-        )
+        return self.scenario_ops_service.run_demo(args)
 
     def list_output_files(self, args):
         directory = Path(self.require_str(args, "directory"))
@@ -1179,29 +700,7 @@ class MCPServer:
         return self.wrap({"path": str(latest_aer) if latest_aer else None})
 
     def summarize_evt(self, args):
-        path = Path(self.require_str(args, "path"))
-        self.assert_path_allowed(path, write=False, purpose="summarize_evt")
-        if not path.exists():
-            return self.wrap({"error": "file not found"})
-        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        counts = {}
-        for line in lines:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#") or stripped.startswith("//"):
-                continue
-            parts = stripped.split()
-            if not parts:
-                continue
-            key = parts[1] if parts[0].upper() == "EVENT" and len(parts) > 1 else parts[0]
-            counts[key] = counts.get(key, 0) + 1
-        top = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-        return self.wrap(
-            {
-                "path": str(path),
-                "line_count": len(lines),
-                "event_counts": [{"event": k, "count": v} for k, v in top],
-            }
-        )
+        return self.analysis_service.summarize_evt(args)
 
     def tail_text_file(self, args):
         path = Path(self.require_str(args, "path"))
@@ -1212,6 +711,12 @@ class MCPServer:
         lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
         tail = lines[-line_count:] if line_count > 0 else []
         return self.wrap({"path": str(path), "lines": tail})
+
+    def analyze_scenario_outputs(self, args):
+        return self.analysis_service.analyze_scenario_outputs(args)
+
+    def build_showcase_package(self, args):
+        return self.showcase_service.build_showcase_package(args)
 
     def scenario_path(self, scenario_id):
         return self.scenarios_dir / f"{scenario_id}.json"
@@ -1378,183 +883,25 @@ class MCPServer:
         return text[:max_chars] + "\n...<truncated>\n"
 
     def start_background_process(self, cmd, working_dir, *, env=None):
-        process_id = str(uuid.uuid4())
-        stdout_path = self.processes_dir / f"{process_id}.stdout.txt"
-        stderr_path = self.processes_dir / f"{process_id}.stderr.txt"
-
-        stdout_fh = stdout_path.open("w", encoding="utf-8", errors="ignore")
-        stderr_fh = stderr_path.open("w", encoding="utf-8", errors="ignore")
-        try:
-            proc = Popen(
-                cmd,
-                cwd=working_dir if working_dir else None,
-                stdout=stdout_fh,
-                stderr=stderr_fh,
-                stdin=DEVNULL,
-                text=True,
-                env=env,
-            )
-        except Exception:
-            stdout_fh.close()
-            stderr_fh.close()
-            raise
-
-        record = {
-            "process_id": process_id,
-            "pid": proc.pid,
-            "cmd": [str(c) for c in cmd],
-            "working_dir": str(working_dir) if working_dir else None,
-            "start_time": self.now(),
-            "end_time": None,
-            "status": "running",
-            "returncode": None,
-            "stdout_path": str(stdout_path),
-            "stderr_path": str(stderr_path),
-        }
-        self._processes[process_id] = {
-            "popen": proc,
-            "stdout_fh": stdout_fh,
-            "stderr_fh": stderr_fh,
-            "record": record,
-        }
-        self.write_json(self.processes_dir / f"{process_id}.json", record)
-        return record
+        return self.runtime_service.start_background_process(cmd, working_dir, env=env)
 
     def get_process_status(self, args):
-        process_id = self.require_str(args, "process_id")
-        item = self._processes.get(process_id)
-        record_path = self.processes_dir / f"{process_id}.json"
-
-        if not item:
-            if record_path.exists():
-                record = self.read_json(record_path)
-                record.setdefault("note", "process not in memory (server may have restarted)")
-                return self.wrap(record)
-            raise JsonRpcError(-32602, "Unknown process_id", {"process_id": process_id})
-
-        proc = item["popen"]
-        rc = proc.poll()
-        record = item["record"]
-        if rc is None:
-            record["status"] = "running"
-            record["returncode"] = None
-        else:
-            record["status"] = "completed" if rc == 0 else "failed"
-            record["returncode"] = rc
-            record["end_time"] = self.now()
-            try:
-                item["stdout_fh"].close()
-            except Exception:
-                pass
-            try:
-                item["stderr_fh"].close()
-            except Exception:
-                pass
-            self._processes.pop(process_id, None)
-        self.write_json(record_path, record)
-        return self.wrap(record)
+        return self.runtime_service.get_process_status(args)
 
     def stop_process(self, args):
-        process_id = self.require_str(args, "process_id")
-        item = self._processes.get(process_id)
-        if not item:
-            raise JsonRpcError(-32602, "Unknown process_id", {"process_id": process_id})
-
-        proc = item["popen"]
-        stopped = False
-        try:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                proc.kill()
-            stopped = True
-        finally:
-            try:
-                item["stdout_fh"].close()
-            except Exception:
-                pass
-            try:
-                item["stderr_fh"].close()
-            except Exception:
-                pass
-            self._processes.pop(process_id, None)
-
-        record_path = self.processes_dir / f"{process_id}.json"
-        if record_path.exists():
-            record = self.read_json(record_path)
-            record["status"] = "stopped"
-            record["end_time"] = self.now()
-            self.write_json(record_path, record)
-        return self.wrap({"process_id": process_id, "stopped": stopped})
+        return self.runtime_service.stop_process(args)
 
     def run_process(self, cmd, working_dir, *, timeout_sec=None, max_output_chars=20000, background=False, env=None):
-        if background:
-            record = self.start_background_process(cmd, working_dir, env=env)
-            return self.wrap(record)
-
-        try:
-            result = run(
-                cmd,
-                capture_output=True,
-                text=True,
-                cwd=working_dir if working_dir else None,
-                timeout=timeout_sec if timeout_sec else None,
-                env=env,
-            )
-        except TimeoutExpired:
-            raise JsonRpcError(
-                -32001,
-                "Process timeout",
-                {"cmd": [str(c) for c in cmd], "working_dir": working_dir, "timeout_sec": timeout_sec},
-            )
-
-        return self.wrap(
-            {
-                "returncode": result.returncode,
-                "stdout": self.truncate_text(result.stdout, int(max_output_chars) if max_output_chars else 0),
-                "stderr": self.truncate_text(result.stderr, int(max_output_chars) if max_output_chars else 0),
-            }
-        )
+        return self.runtime_service.run_process(cmd, working_dir, timeout_sec=timeout_sec, max_output_chars=max_output_chars, background=background, env=env)
 
     def resolve_exe(self, base_name):
-        direct = os.environ.get(f"AFSIM_{base_name.upper()}_PATH")
-        if direct and Path(direct).exists():
-            return Path(direct)
-        bin_path = self.resolve_bin_path()
-        if bin_path:
-            candidate = bin_path / f"{base_name}.exe"
-            if candidate.exists():
-                return candidate
-            candidate = bin_path / base_name
-            if candidate.exists():
-                return candidate
-        return None
+        return self.runtime_service.resolve_exe(base_name)
 
     def resolve_bin_path(self):
-        env_bin = os.environ.get("AFSIM_BIN")
-        if env_bin:
-            path = Path(env_bin)
-            if path.exists():
-                return path
-        config = self.read_config()
-        cfg_bin = config.get("afsim_bin")
-        if cfg_bin:
-            path = Path(cfg_bin)
-            if path.exists():
-                return path
-        afsim_root = self.resolve_afsim_root()
-        if afsim_root:
-            candidate = afsim_root / "bin"
-            if candidate.exists():
-                return candidate
-        repo_bin = self.base_dir.parent / "bin"
-        if repo_bin.exists():
-            return repo_bin
-        return None
+        return self.runtime_service.resolve_bin_path()
 
     def get_demos_root(self):
-        return self.resolve_demos_root()
+        return self.runtime_service.get_demos_root()
 
     def get_observer_block(self):
         """Return the standard Brawler observer script_variables block.
@@ -1594,59 +941,10 @@ class MCPServer:
     def generate_basic_scenario_entities_text(
         self, aircraft_count, tank_count, side, center_lat, center_lon
     ):
-        lines = []
-        for idx in range(aircraft_count):
-            lat = center_lat + 0.01 * idx
-            lon = center_lon + 0.01 * idx
-            start_pos = self.format_lat_lon(lat, lon)
-            end_pos = self.format_lat_lon(lat + 0.05, lon + 0.05)
-            lines.append(f"platform aircraft_{idx+1} WSF_PLATFORM")
-            lines.append("   spatial_domain air")
-            lines.append(f"   side {side}")
-            lines.append("   icon F-18")
-            lines.append("   add mover WSF_AIR_MOVER")
-            lines.append("   end_mover")
-            lines.append("   route")
-            lines.append(f"      position {start_pos} altitude 6000 ft speed 500 kts")
-            lines.append(f"      position {end_pos} altitude 6000 ft speed 500 kts")
-            lines.append("   end_route")
-            lines.append("end_platform")
-            lines.append("")
-        for idx in range(tank_count):
-            lat = center_lat - 0.02 * idx
-            lon = center_lon - 0.02 * idx
-            start_pos = self.format_lat_lon(lat, lon)
-            end_pos = self.format_lat_lon(lat + 0.01, lon + 0.01)
-            lines.append(f"platform tank_{idx+1} WSF_PLATFORM")
-            lines.append(f"   side {side}")
-            lines.append("   icon tank")
-            lines.append("   mover WSF_GROUND_MOVER")
-            lines.append("      on_ground")
-            lines.append("      route")
-            lines.append(f"         position {start_pos} altitude 1 m speed 20 km/hr")
-            lines.append(f"         position {end_pos}")
-            lines.append("         stop")
-            lines.append("      end_route")
-            lines.append("   end_mover")
-            lines.append("end_platform")
-            lines.append("")
-        return "\n".join(lines).strip() + "\n"
+        return self.scenario_ops_service.generate_basic_scenario_entities_text(aircraft_count, tank_count, side, center_lat, center_lon)
 
     def generate_basic_entrypoint_text(self, scenario_name: str, duration_min: float) -> str:
-        scenario_name = str(scenario_name)
-        lines = []
-        lines.append("file_path .")
-        lines.append("realtime")
-        lines.append(f"end_time {duration_min} min")
-        lines.append("")
-        lines.append(self.build_observer_block_text().rstrip())
-        lines.append("")
-        lines.append(f"include_once scenarios/{scenario_name}.txt")
-        lines.append("event_pipe")
-        lines.append("   enable AIRCOMBAT")
-        lines.append("end_event_pipe")
-        lines.append("")
-        return "\n".join(lines).strip() + "\n"
+        return self.scenario_ops_service.generate_basic_entrypoint_text(scenario_name, duration_min)
 
     def format_lat_lon(self, lat, lon):
         lat_suffix = "n" if lat >= 0 else "s"
@@ -1654,44 +952,253 @@ class MCPServer:
         return f"{abs(lat):.3f}{lat_suffix} {abs(lon):.3f}{lon_suffix}"
 
     def parse_prompt_counts(self, prompt):
-        text = prompt or ""
-        counts = {}
-        aircraft = self.extract_count(text, ["飞机", "aircraft", "飞机群"])
-        tank = self.extract_count(text, ["坦克", "tank"])
-        if aircraft:
-            counts["aircraft"] = aircraft
-        if tank:
-            counts["tank"] = tank
-        return counts
+        return self.scenario_ops_service.parse_prompt_counts(prompt)
 
     def extract_count(self, text, keywords):
-        for key in keywords:
-            if key in text:
-                num = self.find_nearest_number(text, key)
-                if num:
-                    return num
-        return None
+        return self.scenario_ops_service.extract_count(text, keywords)
 
     def find_nearest_number(self, text, key):
-        idx = text.find(key)
-        if idx == -1:
-            return None
-        window = text[max(0, idx - 6) : idx + len(key) + 6]
-        digits = "".join([c for c in window if c.isdigit()])
-        if digits:
-            return int(digits)
-        cn_map = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
-        for k, v in cn_map.items():
-            if k in window:
-                return v
-        return None
+        return self.scenario_ops_service.find_nearest_number(text, key)
 
     def find_latest_aer(self, base_dir):
-        candidates = list(base_dir.rglob("*.aer"))
+        return self.runtime_service.find_latest_aer(base_dir)
+
+    def find_latest_matching_file(self, base_dir, pattern):
+        if not base_dir:
+            return None
+        base_dir = Path(base_dir)
+        if not base_dir.exists():
+            return None
+        candidates = list(base_dir.rglob(pattern))
         if not candidates:
             return None
         candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         return candidates[0]
+
+    def resolve_scenario_output_paths(self, output_path, project_dir=None):
+        return self.scenario_ops_service.resolve_scenario_output_paths(output_path, project_dir=project_dir)
+
+    def build_operational_model(self, args, scenario_name, prompt, refinement=None):
+        raw_model = args.get("operational_model") or {}
+        if raw_model and not isinstance(raw_model, dict):
+            raise JsonRpcError(-32602, "Invalid params", {"reason": "operational_model must be an object"})
+        return self.planning_service.build_operational_model(args, scenario_name, prompt, refinement=refinement)
+
+    def refine_operational_prompt_payload(self, args, scenario_name, prompt):
+        return self.planning_service.refine_operational_prompt_payload(args, scenario_name, prompt)
+
+    def classify_operational_prompt(self, prompt):
+        return self.planning_service.classify_operational_prompt(prompt)
+
+    def default_operational_summary(self, scenario_kind):
+        return self.planning_service.default_operational_summary(scenario_kind)
+
+    def infer_mission_title(self, prompt, scenario_name, scenario_kind):
+        return self.planning_service.infer_mission_title(prompt, scenario_name, scenario_kind)
+
+    def infer_mission_summary(self, prompt, scenario_kind, replay_focus):
+        return self.planning_service.infer_mission_summary(prompt, scenario_kind, replay_focus)
+
+    def infer_operational_objectives(self, prompt, scenario_kind, desired_kpis):
+        return self.planning_service.infer_operational_objectives(prompt, scenario_kind, desired_kpis)
+
+    def default_operational_objectives(self, scenario_kind):
+        return self.planning_service.default_operational_objectives(scenario_kind)
+
+    def default_operational_phases(self, scenario_kind, duration_min):
+        return self.planning_service.default_operational_phases(scenario_kind, duration_min)
+
+    def default_engagement_rules(self, scenario_kind):
+        return self.planning_service.default_engagement_rules(scenario_kind)
+
+    def normalize_force_packages(self, raw_forces, scenario_kind):
+        return self.planning_service.normalize_force_packages(raw_forces, scenario_kind)
+
+    def default_force_packages(self, scenario_kind):
+        return self.planning_service.default_force_packages(scenario_kind)
+
+    def infer_duration_from_prompt(self, prompt, fallback):
+        return self.planning_service.infer_duration_from_prompt(prompt, fallback)
+
+    def infer_center_from_prompt(self, prompt, fallback_center):
+        return self.planning_service.infer_center_from_prompt(prompt, fallback_center)
+
+    def describe_theater(self, center):
+        return self.planning_service.describe_theater(center)
+
+    def infer_replay_focus(self, prompt, scenario_kind):
+        return self.planning_service.infer_replay_focus(prompt, scenario_kind)
+
+    def infer_desired_kpis(self, prompt, scenario_kind):
+        return self.planning_service.infer_desired_kpis(prompt, scenario_kind)
+
+    def infer_force_packages_from_prompt(self, prompt, scenario_kind):
+        return self.planning_service.infer_force_packages_from_prompt(prompt, scenario_kind)
+
+    def summarize_force_guidance(self, forces):
+        return self.planning_service.summarize_force_guidance(forces)
+
+    def collect_prompt_assumptions(self, prompt, raw_model, center, duration_min):
+        return self.planning_service.collect_prompt_assumptions(prompt, raw_model, center, duration_min)
+
+    def identify_system_filled_fields(self, prompt, raw_model):
+        return self.planning_service.identify_system_filled_fields(prompt, raw_model)
+
+    def assess_refinement_confidence(self, prompt, raw_model, replay_focus, desired_kpis, filled_by_system):
+        return self.planning_service.assess_refinement_confidence(prompt, raw_model, replay_focus, desired_kpis, filled_by_system)
+
+    def build_questions_needed(self, scenario_kind, low_confidence, filled_by_system):
+        return self.planning_service.build_questions_needed(scenario_kind, low_confidence, filled_by_system)
+
+    def render_prompt_refinement_markdown(self, refinement):
+        return self.planning_service.render_prompt_refinement_markdown(refinement)
+
+    def render_project_settings_plan_markdown(self, model, refinement=None):
+        return self.planning_service.render_project_settings_plan_markdown(model, refinement=refinement)
+
+    def extract_project_model_from_plan_text(self, text):
+        return self.planning_service.extract_project_model_from_plan_text(text)
+
+    def extract_prompt_from_project_brief_text(self, text):
+        return self.planning_service.extract_prompt_from_project_brief_text(text)
+
+    def default_icon_for_category(self, category):
+        return self.asset_service.default_icon_for_category(category)
+
+    def resolve_operational_asset_profile(self, scenario_kind):
+        return self.asset_service.resolve_operational_asset_profile(scenario_kind)
+
+    def render_operational_entrypoint_text(self, model):
+        return self.generation_service.render_operational_entrypoint_text(model)
+
+    def render_operational_scenario_text(self, model):
+        return self.generation_service.render_operational_scenario_text(model)
+
+    def render_operational_scenario_text_with_assets(self, model):
+        return self.generation_service.render_operational_scenario_text_with_assets(model)
+
+    def render_route_block(self, route_name, points):
+        return self.generation_service.render_route_block(route_name, points)
+
+    def render_fighter_platform_block(self, name, fighter_type, side, route_name, start_point, *, role, enemy_type, friendly_type, flight_id, id_flag, weapons):
+        return self.generation_service.render_fighter_platform_block(name, fighter_type, side, route_name, start_point, role=role, enemy_type=enemy_type, friendly_type=friendly_type, flight_id=flight_id, id_flag=id_flag, weapons=weapons)
+
+    def render_blue_air_defense_block(self, name, anchor, asset_profile):
+        return self.generation_service.render_blue_air_defense_block(name, anchor, asset_profile)
+
+    def render_ballistic_launcher_block(self, name, side, unit_index, target, points, asset_profile, launch_time_sec=None):
+        return self.generation_service.render_ballistic_launcher_block(name, side, unit_index, target, points, asset_profile, launch_time_sec=launch_time_sec)
+
+    def default_weapons_for_role(self, role):
+        return self.asset_service.default_weapons_for_role(role)
+
+    def risk_weapon_for_role(self, role):
+        return self.asset_service.risk_weapon_for_role(role)
+
+    def commit_range_for_role(self, role):
+        return self.asset_service.commit_range_for_role(role)
+
+    def select_preferred_target(self, objectives, preferred_side):
+        return self.asset_service.select_preferred_target(objectives, preferred_side)
+
+    def build_package_points(self, side, category, package_index, unit_index, center, route_style=None, fallback_route_style=None):
+        return self.generation_service.build_package_points(side, category, package_index, unit_index, center, route_style=route_style, fallback_route_style=fallback_route_style)
+
+    def slugify(self, text):
+        return self.generation_service.slugify(text)
+
+    def render_operational_briefing(self, model):
+        return self.generation_service.render_operational_briefing(model)
+
+    def render_operational_phases_markdown(self, model):
+        return self.generation_service.render_operational_phases_markdown(model)
+
+    def parse_evt_records(self, evt_path):
+        return self.analysis_service.parse_evt_records(evt_path)
+
+    def parse_evt_payload_fields(self, payload):
+        return self.analysis_service.parse_evt_payload_fields(payload)
+
+    def build_output_analysis(self, records, *, scenario_dir=None, evt_path=None, sensor_path=None, aer_path=None):
+        return self.analysis_service.build_output_analysis(records, scenario_dir=scenario_dir, evt_path=evt_path, sensor_path=sensor_path, aer_path=aer_path)
+
+    def event_to_timeline_item(self, record):
+        return self.analysis_service.event_to_timeline_item(record)
+
+    def build_recommended_keyframes(self, timeline, chains, aer_path):
+        return self.analysis_service.build_recommended_keyframes(timeline, chains, aer_path)
+
+    def load_operational_model_for_scenario(self, scenario_dir):
+        return self.analysis_service.load_operational_model_for_scenario(scenario_dir)
+
+    def build_kpi_summary(self, model, first_detection_by_side, first_shot_by_side, first_hit_by_side, first_kill_by_side, broken_platforms, objective_inventory_by_side, losses, chains, timeline):
+        return self.analysis_service.build_kpi_summary(model, first_detection_by_side, first_shot_by_side, first_hit_by_side, first_kill_by_side, broken_platforms, objective_inventory_by_side, losses, chains, timeline)
+
+    def compute_objective_survival(self, model, broken_platforms):
+        return self.analysis_service.compute_objective_survival(model, broken_platforms)
+
+    def compute_event_objective_survival(self, objective_inventory_by_side, broken_platforms):
+        return self.analysis_service.compute_event_objective_survival(objective_inventory_by_side, broken_platforms)
+
+    def compute_kill_chain_closure(self, first_detection_by_side, first_shot_by_side, first_hit_by_side, first_kill_by_side, chains, timeline):
+        return self.analysis_service.compute_kill_chain_closure(first_detection_by_side, first_shot_by_side, first_hit_by_side, first_kill_by_side, chains, timeline)
+
+    def update_first_event_time(self, store, side, value):
+        return self.analysis_service.update_first_event_time(store, side, value)
+
+    def opposing_side(self, side):
+        return self.analysis_service.opposing_side(side)
+
+    def format_optional_time(self, seconds):
+        return self.analysis_service.format_optional_time(seconds)
+
+    def infer_side(self, name):
+        return self.analysis_service.infer_side(name)
+
+    def looks_like_weapon(self, name):
+        return self.analysis_service.looks_like_weapon(name)
+
+    def classify_loss_bucket(self, platform_type, platform_name):
+        return self.analysis_service.classify_loss_bucket(platform_type, platform_name)
+
+    def is_objective_platform(self, platform_type, platform_name):
+        return self.analysis_service.is_objective_platform(platform_type, platform_name)
+
+    def render_analysis_markdown(self, analysis):
+        return self.analysis_service.render_analysis_markdown(analysis)
+
+    def render_showcase_briefing(self, title, model, analysis, scenario_dir, refinement=None):
+        return self.showcase_service.render_showcase_briefing(title, model, analysis, scenario_dir, refinement)
+
+    def render_showcase_replay_plan(self, title, model, analysis, scenario_dir, refinement=None):
+        return self.showcase_service.render_showcase_replay_plan(title, model, analysis, scenario_dir, refinement)
+
+    def prioritize_replay_keyframes(self, analysis, refinement=None):
+        return self.showcase_service.prioritize_replay_keyframes(analysis, refinement)
+
+    def find_kpi_candidate_keyframe(self, kpi, keyframes, timeline):
+        return self.showcase_service.find_kpi_candidate_keyframe(kpi, keyframes, timeline)
+
+    def synthetic_kpi_keyframe(self, kpi, timeline):
+        return self.showcase_service.synthetic_kpi_keyframe(kpi, timeline)
+
+    def find_first_timeline_time(self, timeline, tokens):
+        return self.showcase_service.find_first_timeline_time(timeline, tokens)
+
+    def keyframe_matches_kpi(self, keyframe, kpi):
+        return self.showcase_service.keyframe_matches_kpi(keyframe, kpi)
+
+    def timeline_item_to_keyframe(self, item):
+        return self.showcase_service.timeline_item_to_keyframe(item)
+
+    def render_showcase_speaker_notes(self, title, model, analysis, refinement=None):
+        return self.showcase_service.render_showcase_speaker_notes(title, model, analysis, refinement)
+
+    def format_time_label(self, seconds):
+        total_seconds = int(float(seconds or 0))
+        minutes = total_seconds // 60
+        remain = total_seconds % 60
+        return f"{minutes:02d}:{remain:02d}"
 
     def read_config(self):
         if not self.config_path.exists():
@@ -1703,44 +1210,10 @@ class MCPServer:
         self.config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def resolve_wizard_path(self):
-        direct = os.environ.get("AFSIM_WIZARD_PATH")
-        if direct and Path(direct).exists():
-            return Path(direct)
-        env_bin = os.environ.get("AFSIM_BIN")
-        if env_bin:
-            candidate = Path(env_bin) / "wizard.exe"
-            if candidate.exists():
-                return candidate
-            candidate = Path(env_bin) / "wizard"
-            if candidate.exists():
-                return candidate
-        bin_path = self.resolve_bin_path()
-        if bin_path:
-            candidate = bin_path / "wizard.exe"
-            if candidate.exists():
-                return candidate
-            candidate = bin_path / "wizard"
-            if candidate.exists():
-                return candidate
-        return None
+        return self.runtime_service.resolve_wizard_path()
 
     def get_runs(self, scenario_id):
-        runs = []
-        for data in self.get_run_records(scenario_id):
-            runs.append(
-                {
-                    "run_id": data.get("id"),
-                    "status": data.get("status"),
-                    "start_time": data.get("start_time"),
-                    "end_time": data.get("end_time"),
-                }
-            )
-        return runs
+        return self.results_service.get_runs(scenario_id)
 
     def get_run_records(self, scenario_id):
-        records = []
-        for path in self.runs_dir.glob("*.json"):
-            data = self.read_json(path)
-            if data.get("scenario_id") == scenario_id:
-                records.append(data)
-        return records
+        return self.results_service.get_run_records(scenario_id)

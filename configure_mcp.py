@@ -88,15 +88,15 @@ def build_config_json(platform_name, command, args, env):
 
 
 def main():
-    default_state_dir = Path.home() / ".afsim_mcp"
-    state_dir = prompt_path(
+    default_config_dir = Path.home() / ".afsim_mcp"
+    config_dir = prompt_path(
         "配置文件存放目录",
         optional=True,
-        default_value=default_state_dir,
-        help_text="用于保存本机配置与状态，建议放在用户目录下",
+        default_value=default_config_dir,
+        help_text="用于保存本机配置，建议放在用户目录下",
     )
-    if state_dir:
-        os.environ["AFSIM_MCP_STATE_DIR"] = state_dir
+    if config_dir:
+        os.environ["AFSIM_MCP_CONFIG_DIR"] = config_dir
     server = MCPServer()
     config = server.read_config()
     if config:
@@ -137,19 +137,20 @@ def main():
         if value:
             config[key] = value
     server.write_config(config)
+    resolved_state_dir = server.resolve_state_dir()
     resolved = {
         "afsim_root": str(server.resolve_afsim_root()) if server.resolve_afsim_root() else None,
         "project_root": str(server.resolve_project_root()) if server.resolve_project_root() else None,
         "demos_root": str(server.resolve_demos_root()) if server.resolve_demos_root() else None,
         "afsim_bin": str(server.resolve_bin_path()) if server.resolve_bin_path() else None,
-        "state_dir": str(server.state_dir),
+        "state_dir": str(resolved_state_dir),
     }
     print("\n配置完成：")
     print(server.config_path)
     print("\n解析结果：")
     for key, value in resolved.items():
         print(f"{key}: {value}")
-    state_dir_str = str(server.state_dir)
+    config_dir_str = str(server.config_dir)
     server_path = (Path(__file__).resolve().parent / "transport" / "stdio.py").resolve()
     server_path_str = str(server_path)
     python_path_str = sys.executable
@@ -158,14 +159,16 @@ def main():
         platform,
         python_path_str,
         [server_path_str],
-        {"AFSIM_MCP_STATE_DIR": state_dir_str},
+        {"AFSIM_MCP_CONFIG_DIR": config_dir_str},
     )
     print("\n通用连接信息（填入你的 MCP 客户端配置即可）：")
     print(f'command: "{python_path_str}"')
     print(f'args: ["{server_path_str}"]')
-    print(f'env: {{"AFSIM_MCP_STATE_DIR": "{state_dir_str}"}}')
+    print(f'env: {{"AFSIM_MCP_CONFIG_DIR": "{config_dir_str}"}}')
     print(f"\n{platform_name} 配置示例：")
     print(json.dumps(payload, ensure_ascii=False, indent=2))
+    print(f"\n运行时状态目录默认解析为：{resolved_state_dir}")
+    print("如需覆盖运行时状态目录，可额外设置 AFSIM_MCP_STATE_DIR。")
     print("\n如果你的客户端配置文件键名不同，请保留 command/args/env 三项并按客户端要求嵌入。")
 
 
