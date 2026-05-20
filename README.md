@@ -1,3 +1,49 @@
+
+# AFSIM MCP Server
+
+MCP (Model Context Protocol) server for the **Advanced Framework for Simulation, Integration, and Modeling (AFSIM)**. Enables LLMs and AI agents to interact with AFSIM through standardized tools.
+
+## Features
+
+| Category | Tools |
+|---|---|
+| **Scenario Management** | `create_scenario`, `load_scenario`, `save_scenario`, `validate_scenario`, `list_scenarios`, `delete_scenario`, `get_scenario_content`, `list_scenario_files` |
+| **Entity & Component Management** | `create_platform`, `delete_platform`, `modify_platform`, `list_platforms`, `add_mover`, `add_sensor`, `add_weapon`, `remove_component`, `list_components` |
+| **Simulation Control** | `run_simulation`, `stop_simulation`, `get_simulation_status`, `list_simulation_runs`, `set_afsim_binary` |
+| **Results Handling** | `list_result_files`, `query_csv_results`, `query_evt_results`, `query_aer_results`, `export_results_to_json`, `get_results_summary` |
+| **AFSIM Backend** | `set_afsim_home`, `detect_afsim_installation`, `set_tool_binary_path`, `run_wizard`, `run_mission`, `run_warlock`, `run_mystic` |
+| **Natural Language** | `generate_scenario_from_prompt`, `refine_scenario_from_prompt` |
+
+## Installation
+
+```bash
+pip install -e .
+```
+
+Or install dependencies directly:
+
+```bash
+pip install mcp
+```
+
+## Usage
+
+### Running the server
+
+```bash
+# Via installed CLI
+afsim-mcp
+
+# Via Python module
+python -m afsim_mcp.server
+```
+
+The server uses **stdio transport** and is compatible with any MCP client (Claude Desktop, VS Code MCP extension, etc.).
+
+### Claude Desktop configuration
+
+Add to `claude_desktop_config.json`:
+=======
 # AFSIM MCP
 
 本项目是一个本地 MCP 服务器，用于把 AFSIM 能力接入支持 MCP 的客户端（如 Cursor、Claude Desktop、VS Code、Trae、OpenCode 等）。
@@ -41,41 +87,34 @@ python configure_mcp.py
 1) 通用连接信息  
 2) 你选择的平台对应的 JSON 配置示例
 
-### 通用格式（适用于大多数客户端）
+
 
 ```json
 {
   "mcpServers": {
     "afsim": {
-      "command": "C:\\path\\to\\python.exe",
-      "args": ["C:\\path\\to\\AFSIM_MCP\\transport\\stdio.py"],
-      "env": {
-        "AFSIM_MCP_CONFIG_DIR": "C:\\Users\\你的用户名\\.afsim_mcp"
-      }
+      "command": "afsim-mcp"
     }
   }
 }
 ```
 
-### OpenCode 格式
+Or if not installed:
 
 ```json
 {
-  "$schema": "https://opencode.ai/config.json",
-  "mcp": {
+  "mcpServers": {
     "afsim": {
-      "type": "local",
-      "command": [
-        "C:\\path\\to\\python.exe",
-        "C:\\path\\to\\AFSIM_MCP\\transport\\stdio.py"
-      ],
-      "enabled": true,
-      "environment": {
-        "AFSIM_MCP_CONFIG_DIR": "C:\\Users\\你的用户名\\.afsim_mcp"
-      }
+      "command": "python",
+      "args": ["-m", "afsim_mcp.server"],
+      "cwd": "/path/to/AFSIM_MCP"
     }
   }
 }
 ```
+
+
+
+
 
 
