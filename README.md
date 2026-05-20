@@ -1,3 +1,4 @@
+
 # AFSIM MCP Server
 
 MCP (Model Context Protocol) server for the **Advanced Framework for Simulation, Integration, and Modeling (AFSIM)**. Enables LLMs and AI agents to interact with AFSIM through standardized tools.
@@ -42,6 +43,51 @@ The server uses **stdio transport** and is compatible with any MCP client (Claud
 ### Claude Desktop configuration
 
 Add to `claude_desktop_config.json`:
+=======
+# AFSIM MCP
+
+本项目是一个本地 MCP 服务器，用于把 AFSIM 能力接入支持 MCP 的客户端（如 Cursor、Claude Desktop、VS Code、Trae、OpenCode 等）。
+
+仓库只包含 MCP 服务源码与配置脚本，不附带测试工程、测试数据、示例生成产物或本地运行状态。实际使用时，请把 AFSIM 工程目录通过配置指向你自己的 `project_root`。
+
+如需给大模型或团队成员提供统一项目背景与建模建议，可参考仓库中的 `memory.md`。
+如需评估当前项目真实能力边界，可参考 `CAPABILITY_ASSESSMENT.md`；如需约束接入大模型的标准工作流，可参考 `MODEL_WORKFLOW_PROMPT.md`。
+
+## 前置条件
+
+- Windows
+- Python 3.10+
+- 已安装 AFSIM（本机可运行）
+
+## 快速开始
+
+在项目目录执行：
+
+```bash
+python configure_mcp.py
+```
+
+脚本会按提示询问并写入本地配置，同时输出客户端所需的 MCP 配置片段。
+
+### 配置项说明
+
+- AFSIM 根目录：AFSIM 安装目录
+- AFSIM 项目目录：你的 AFSIM 工程目录
+- AFSIM demos 目录：官方示例目录
+- AFSIM bin 目录：`mission.exe` 等可执行文件所在目录
+- 配置文件存放目录：默认 `C:\Users\你的用户名\.afsim_mcp`
+- 运行时状态目录：默认 `project_root\mcp_state`；客户端通常只需要传入 `AFSIM_MCP_CONFIG_DIR` 用于定位配置文件，如需覆盖状态目录可额外设置 `AFSIM_MCP_STATE_DIR`
+
+如果检测到已有配置，脚本会显示旧值；直接回车表示保留旧值。
+
+## 客户端配置
+
+脚本会输出两段内容：
+
+1) 通用连接信息  
+2) 你选择的平台对应的 JSON 配置示例
+
+
 
 ```json
 {
@@ -67,80 +113,8 @@ Or if not installed:
 }
 ```
 
-## Example Workflows
 
-### 1. Generate a scenario from natural language
 
-```
-generate_scenario_from_prompt("Create an air defense scenario with 2 fighters
-and a SAM site, radar sensors, over 2 hours")
-```
 
-### 2. Manual scenario construction
 
-```
-# Create scenario
-create_scenario(name="red_blue", duration_s=7200)
 
-# Add platforms
-create_platform(scenario_id="...", name="alpha_fighter",
-                platform_type="wsf_air_vehicle",
-                latitude=35.5, longitude=-80.2, altitude_m=10000)
-
-# Add components
-add_mover(scenario_id="...", platform_name="alpha_fighter",
-          mover_type="wsf_air_mover")
-add_sensor(scenario_id="...", platform_name="alpha_fighter",
-           sensor_type="wsf_radar_sensor")
-
-# Validate and save
-validate_scenario(scenario_id="...")
-save_scenario(scenario_id="...", file_path="scenarios/red_blue.afsim")
-```
-
-### 3. Run and monitor a simulation
-
-```
-# Configure AFSIM binary (if available)
-set_afsim_home("/opt/afsim")
-
-# Run simulation (dry_run=True if no AFSIM installed)
-run_simulation(scenario_id="...", dry_run=True)
-
-# Check status
-get_simulation_status(run_id="...")
-```
-
-### 4. Query results
-
-```
-list_result_files(directory="simulation_output")
-query_csv_results(file_path="simulation_output/run1/tracks.csv", max_rows=100)
-export_results_to_json(file_path="simulation_output/run1/events.evt")
-```
-
-## Architecture
-
-```
-afsim_mcp/
-├── __init__.py
-├── server.py              # FastMCP server + tool definitions
-├── models.py              # Data models (Scenario, Platform, SimulationRun, …)
-├── scenario_manager.py    # Create/load/save/validate scenarios
-├── entity_manager.py      # Platform & component management
-├── simulation_controller.py  # Run/stop/query simulations
-├── results_handler.py     # List/query/export result files
-├── afsim_backend.py       # Binary path management & tool launching
-└── nl_generator.py        # Natural language → scenario generation
-```
-
-## Testing
-
-```bash
-pip install pytest
-pytest tests/
-```
-
-## License
-
-MIT
